@@ -94,6 +94,94 @@ fn generated_terrain_has_valid_sixteenth_heights() {
 }
 
 #[test]
+fn surface_placement_uses_the_exact_sixteenth_slab_top() {
+    let support = SupportSurface::from_packed(IVec3::new(4, 11, -3), block(GRASS, 5))
+        .expect("a grass slab exposes an upward support surface");
+    let placement = resolve_placement_on_support(support, PlacementPolicy::SurfaceAligned)
+        .expect("ordinary surface objects can stand on a grass slab");
+
+    match placement {
+        ResolvedPlacement::SurfaceAligned { base_y, support } => {
+            assert_eq!(support.top_y_sixteenths, 181);
+            assert!((base_y - 11.3125).abs() < f32::EPSILON);
+        }
+        ResolvedPlacement::DynamicTreeRoot { .. } => panic!("surface policy returned tree root"),
+    }
+}
+
+#[test]
+fn dynamic_tree_root_normalizes_a_slab_to_full_rooty_soil() {
+    let mut blocks = vec![AIR; CHUNK_BLOCK_COUNT];
+    let local_root = IVec3::new(5, 13, 9);
+    let world_root = IVec3::new(-27, 13, 41);
+    let root_index = chunk_block_index(local_root.x, local_root.y, local_root.z);
+    blocks[root_index] = block(GRASS, 7);
+
+    let root = prepare_dynamic_tree_root(&mut blocks, local_root, world_root)
+        .expect("a tree accepts fertile partial soil by converting it to rooty soil");
+
+    assert_eq!(root, world_root);
+    assert_eq!(block_material(blocks[root_index]), ROOTY_SOIL);
+    assert_eq!(block_height_sixteenths(blocks[root_index]), 16);
+    assert_eq!(
+        blocks[chunk_block_index(local_root.x, local_root.y + 1, local_root.z)],
+        AIR
+    );
+}
+
+#[test]
+fn dynamic_tree_root_rejects_non_soil_or_obstructed_support() {
+    let local_root = IVec3::new(3, 12, 7);
+    let world_root = IVec3::new(3, 12, 7);
+    let root_index = chunk_block_index(local_root.x, local_root.y, local_root.z);
+
+    let mut water = vec![AIR; CHUNK_BLOCK_COUNT];
+    water[root_index] = block(WATER, 16);
+    assert_eq!(
+        prepare_dynamic_tree_root(&mut water, local_root, world_root),
+        None
+    );
+
+    let mut obstructed = vec![AIR; CHUNK_BLOCK_COUNT];
+    obstructed[root_index] = block(DIRT, 16);
+    obstructed[chunk_block_index(local_root.x, local_root.y + 1, local_root.z)] = block(STONE, 16);
+    assert_eq!(
+        prepare_dynamic_tree_root(&mut obstructed, local_root, world_root),
+        None
+    );
+}
+
+#[test]
+fn generated_dynamic_trees_have_full_rooty_soil_in_source_chunks() {
+    let mut tree_count = 0;
+    for chunk_z in -3..=3 {
+        for chunk_x in -3..=3 {
+            let position = ChunkPos {
+                x: chunk_x,
+                z: chunk_z,
+            };
+            let chunk = generate_chunk(position);
+            for tree in &chunk.trees {
+                tree_count += 1;
+                let local_x = tree.root.x.rem_euclid(CHUNK_SIZE);
+                let local_z = tree.root.z.rem_euclid(CHUNK_SIZE);
+                let packed = chunk.blocks[chunk_block_index(local_x, tree.root.y, local_z)];
+                assert_eq!(block_material(packed), ROOTY_SOIL);
+                assert_eq!(block_height_sixteenths(packed), 16);
+                assert_eq!(
+                    tree.root.y,
+                    i32::from(terrain_height_units(tree.root.x, tree.root.z) / 16)
+                );
+            }
+        }
+    }
+    assert!(
+        tree_count > 0,
+        "the sample area must contain generated trees"
+    );
+}
+
+#[test]
 fn streamed_windows_have_fixed_gpu_sizes() {
     let mut world = World::new();
     world.bootstrap(Vec3::new(0.0, 20.0, 0.0));

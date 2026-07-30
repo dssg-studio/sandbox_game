@@ -156,6 +156,8 @@ const ACACIA_JO_CODES: &str = include_str!("../assets/dynamictrees/jo_codes/acac
 type Block = u32;
 
 const AIR: Block = 0;
+const BLOCK_MATERIAL_MASK: Block = 0xff;
+const BLOCK_HEIGHT_SHIFT: u32 = 8;
 const GRASS: u32 = 1;
 const DIRT: u32 = 2;
 const STONE: u32 = 3;
@@ -192,7 +194,125 @@ fn game_time_label(world_time: f32) -> String {
 /// in the next byte.  A height of 16 is a regular block; all values 1..=15 are
 /// real slabs, not a visual approximation.
 fn block(material: u32, sixteenths: u32) -> Block {
-    material | (sixteenths.clamp(1, 16) << 8)
+    material | (sixteenths.clamp(1, 16) << BLOCK_HEIGHT_SHIFT)
+}
+
+#[inline]
+fn block_material(packed: Block) -> u32 {
+    packed & BLOCK_MATERIAL_MASK
+}
+
+#[inline]
+fn block_height_sixteenths(packed: Block) -> u8 {
+    ((packed >> BLOCK_HEIGHT_SHIFT) & 0xff) as u8
+}
+
+/// A solid, horizontal surface offered by the upper face of one packed voxel.
+/// Its height is in world 1/16th units, so every gameplay system can use the
+/// same coordinate as the ray tracer rather than deriving a separate offset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SupportSurface {
+    cell: IVec3,
+    material: u32,
+    top_y_sixteenths: i32,
+}
+
+impl SupportSurface {
+    fn from_packed(cell: IVec3, packed: Block) -> Option<Self> {
+        let material = block_material(packed);
+        let height = i32::from(block_height_sixteenths(packed));
+        (material != AIR && material != WATER && height > 0).then_some(Self {
+            cell,
+            material,
+            top_y_sixteenths: cell.y * 16 + height,
+        })
+    }
+
+    fn accepts_dynamic_tree_root(self) -> bool {
+        matches!(self.material, GRASS | DIRT | ROOTY_SOIL)
+    }
+}
+
+/// Placement rules deliberately distinguish a free surface object from a
+/// Dynamic Trees root.  The former is physically aligned to the exact slab
+/// top; the latter must occupy one whole logical Minecraft/DT block cell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlacementPolicy {
+    SurfaceAligned,
+    DynamicTreeRoot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResolvedPlacement {
+    SurfaceAligned {
+        support: SupportSurface,
+        base_y: f32,
+    },
+    DynamicTreeRoot {
+        support: SupportSurface,
+        root: IVec3,
+    },
+}
+
+fn resolve_placement_on_support(
+    support: SupportSurface,
+    policy: PlacementPolicy,
+) -> Option<ResolvedPlacement> {
+    match policy {
+        PlacementPolicy::SurfaceAligned => Some(ResolvedPlacement::SurfaceAligned {
+            support,
+            base_y: support.top_y_sixteenths as f32 / 16.0,
+        }),
+        PlacementPolicy::DynamicTreeRoot => {
+            support
+                .accepts_dynamic_tree_root()
+                .then_some(ResolvedPlacement::DynamicTreeRoot {
+                    support,
+                    root: support.cell,
+                })
+        }
+    }
+}
+
+#[inline]
+fn chunk_block_index(x: i32, y: i32, z: i32) -> usize {
+    debug_assert!((0..CHUNK_SIZE).contains(&x));
+    debug_assert!((0..WORLD_HEIGHT).contains(&y));
+    debug_assert!((0..CHUNK_SIZE).contains(&z));
+    (x + CHUNK_SIZE * (z + CHUNK_SIZE * y)) as usize
+}
+
+/// Resolves the source-style DT root placement and atomically normalizes the
+/// substrate.  Dynamic Trees has a full rooty-soil block and its first branch
+/// begins at `root + UP`; a fractional rendering offset would split visual and
+/// simulation coordinates.  We therefore replace the supporting slab before
+/// creating the tree, just as TerrainSlabs does when a sapling grows.
+fn prepare_dynamic_tree_root(
+    blocks: &mut [Block],
+    local_support_cell: IVec3,
+    world_support_cell: IVec3,
+) -> Option<IVec3> {
+    let support_index = chunk_block_index(
+        local_support_cell.x,
+        local_support_cell.y,
+        local_support_cell.z,
+    );
+    let support = SupportSurface::from_packed(world_support_cell, blocks[support_index])?;
+    let ResolvedPlacement::DynamicTreeRoot { root, .. } =
+        resolve_placement_on_support(support, PlacementPolicy::DynamicTreeRoot)?
+    else {
+        unreachable!("the DynamicTreeRoot policy resolves only a tree root")
+    };
+
+    let above_y = local_support_cell.y + 1;
+    if above_y >= WORLD_HEIGHT
+        || blocks[chunk_block_index(local_support_cell.x, above_y, local_support_cell.z)] != AIR
+    {
+        return None;
+    }
+
+    blocks[support_index] = block(ROOTY_SOIL, 16);
+    Some(root)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2884,13 +3004,21 @@ impl World {
                 // its visible Eco Machina prism is thinner than a voxel. The
                 // selection frame intentionally encloses that logical cell,
                 // matching Minecraft/Dynamic Trees interaction semantics.
-                let height = if packed == AIR {
-                    1.0
-                } else {
-                    ((packed >> 8) & 255) as f32 / 16.0
-                };
                 let minimum = cell.as_vec3();
-                let maximum = minimum + Vec3::new(1.0, height, 1.0);
+                let maximum_y = if packed == AIR {
+                    minimum.y + 1.0
+                } else {
+                    let support = SupportSurface::from_packed(cell, packed)
+                        .expect("a non-air pickable block has an upper support surface");
+                    let ResolvedPlacement::SurfaceAligned { base_y, .. } =
+                        resolve_placement_on_support(support, PlacementPolicy::SurfaceAligned)
+                            .expect("surface-aligned placement accepts every solid voxel")
+                    else {
+                        unreachable!("surface policy cannot resolve a Dynamic Trees root")
+                    };
+                    base_y
+                };
+                let maximum = Vec3::new(minimum.x + 1.0, maximum_y, minimum.z + 1.0);
                 if let Some((entry, exit)) =
                     ray_aabb_interval_cpu(origin, direction, minimum, maximum)
                     && entry <= cell_exit + 0.002
@@ -3001,8 +3129,10 @@ impl World {
                 && slots.contains(&slot)
             {
                 let index = Self::block_index_in_slot(slot, root);
-                let height = (self.detailed_blocks[index] >> 8) & 255;
-                self.detailed_blocks[index] = block(ROOTY_SOIL, height);
+                // Tree roots are normalized before their DT graph is created.
+                // Keep that invariant after every ring repaint as well: the
+                // root is a full block, never a rooty-looking partial slab.
+                self.detailed_blocks[index] = block(ROOTY_SOIL, 16);
             }
         }
         for (leaf, material) in leaves {
@@ -3397,7 +3527,7 @@ fn generate_chunk(position: ChunkPos) -> Chunk {
             let full = ground / 16;
             let partial = ground % 16;
             for y in 0..WORLD_HEIGHT {
-                let index = (x + CHUNK_SIZE * (z + CHUNK_SIZE * y)) as usize;
+                let index = chunk_block_index(x, y, z);
                 blocks[index] = if y < full {
                     if y < full - 3 {
                         block(STONE, 16)
@@ -3432,10 +3562,12 @@ fn generate_chunk(position: ChunkPos) -> Chunk {
         if ground_units < 160 {
             continue;
         }
-        trees.push(Tree::new(
-            IVec3::new(world_x, i32::from(ground_units / 16), world_z),
-            h,
-        ));
+        let local_root = IVec3::new(local_x, i32::from(ground_units / 16), local_z);
+        let world_root = IVec3::new(world_x, local_root.y, world_z);
+        let Some(root) = prepare_dynamic_tree_root(&mut blocks, local_root, world_root) else {
+            continue;
+        };
+        trees.push(Tree::new(root, h));
     }
     Chunk {
         blocks: blocks.into(),
