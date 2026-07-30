@@ -1,0 +1,34 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Attach current RayVoxel PID 42588 (MSVC)",
+      "type": "cppvsdbg",
+      "request": "attach",
+      "processId": 42588
+    },
+    {
+      "name": "Debug current RayVoxel binary (MSVC)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\target\\debug\\sandbox_game.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Debug RayVoxel (MSVC)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\target\\debug\\sandbox_game.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "console": "integratedTerminal",
+      "preLaunchTask": "cargo build (debug)"
+    }
+  ]
+}

@@ -19,10 +19,10 @@ use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::{ElementState, WindowEvent},
+    event::{DeviceEvent, ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowId},
+    window::{CursorGrabMode, Window, WindowId},
 };
 
 // Tracy's convenience macros deliberately panic when no capture client has
@@ -80,6 +80,23 @@ const LOD_RADIUS: i32 = 256;
 const DETAIL_DIAMETER: i32 = DETAIL_RADIUS * 2 + 1;
 const DETAIL_CHUNK_COUNT: usize = (DETAIL_DIAMETER * DETAIL_DIAMETER) as usize;
 const CHUNK_BLOCK_COUNT: usize = (CHUNK_SIZE * CHUNK_SIZE * WORLD_HEIGHT) as usize;
+const DETAIL_BRICK_SIZE: i32 = 4;
+const DETAIL_BRICKS_PER_CHUNK: usize =
+    (CHUNK_SIZE / DETAIL_BRICK_SIZE * CHUNK_SIZE / DETAIL_BRICK_SIZE * WORLD_HEIGHT
+        / DETAIL_BRICK_SIZE) as usize;
+const DETAIL_FINE_OCCUPANCY_WORDS_PER_CHUNK: usize = CHUNK_BLOCK_COUNT.div_ceil(32);
+const DETAIL_FINE_OCCUPANCY_WORDS: usize =
+    DETAIL_CHUNK_COUNT * DETAIL_FINE_OCCUPANCY_WORDS_PER_CHUNK;
+const DETAIL_BRICK_OCCUPANCY_WORDS_PER_CHUNK: usize = DETAIL_BRICKS_PER_CHUNK.div_ceil(32);
+const DETAIL_BRICK_OCCUPANCY_OFFSET: usize = DETAIL_FINE_OCCUPANCY_WORDS;
+const DETAIL_BRICK_OCCUPANCY_WORDS: usize =
+    DETAIL_CHUNK_COUNT * DETAIL_BRICK_OCCUPANCY_WORDS_PER_CHUNK;
+const DETAIL_COARSE_OCCUPANCY_OFFSET: usize =
+    DETAIL_BRICK_OCCUPANCY_OFFSET + DETAIL_BRICK_OCCUPANCY_WORDS;
+const DETAIL_COARSE_OCCUPANCY_WORDS: usize =
+    (DETAIL_CHUNK_COUNT * (WORLD_HEIGHT / CHUNK_SIZE) as usize).div_ceil(32);
+const DETAIL_OCCUPANCY_WORDS: usize =
+    DETAIL_COARSE_OCCUPANCY_OFFSET + DETAIL_COARSE_OCCUPANCY_WORDS;
 /// Chunks outside the 9×9 ray-traced window are prepared before they are
 /// needed.  They never enter the renderer until the complete next stripe is
 /// ready, so a stream transition has no hole or synchronous fallback path.
@@ -147,6 +164,10 @@ const OAK_LEAVES: u32 = 6;
 const SPRUCE_LEAVES: u32 = 7;
 const ACACIA_LEAVES: u32 = 8;
 const ROOTY_SOIL: u32 = 9;
+/// Block interaction reach for the centre-screen selection frame. The camera
+/// is free-flying, so this is deliberately a little farther than Minecraft's
+/// survival reach while remaining inside the fully detailed voxel window.
+const BLOCK_SELECTION_DISTANCE: f32 = 8.0;
 /// Authored tree materials use a single native 64×64 pixel-art tile. Keeping
 /// this size exact avoids a resample between the source PNG and GPU atlas.
 const TREE_TEXTURE_TILE_SIZE: u32 = 64;
@@ -159,6 +180,42 @@ const TREE_TEXTURE_CONFIG_PATH: &str = "assets/tree/tree_textures.json";
 /// real slabs, not a visual approximation.
 fn block(material: u32, sixteenths: u32) -> Block {
     material | (sixteenths.clamp(1, 16) << 8)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlockSelection {
+    cell: IVec3,
+    minimum: Vec3,
+    maximum: Vec3,
+}
+
+/// Exact CPU counterpart of the shader's slab AABB test. It is only used for
+/// the one centre-screen interaction ray, never for rendering the world.
+fn ray_aabb_interval_cpu(
+    origin: Vec3,
+    direction: Vec3,
+    minimum: Vec3,
+    maximum: Vec3,
+) -> Option<(f32, f32)> {
+    let mut entry = f32::NEG_INFINITY;
+    let mut exit = f32::INFINITY;
+    for axis in 0..3 {
+        let origin_axis = origin[axis];
+        let direction_axis = direction[axis];
+        let minimum_axis = minimum[axis];
+        let maximum_axis = maximum[axis];
+        if direction_axis.abs() <= 1.0e-6 {
+            if origin_axis < minimum_axis || origin_axis > maximum_axis {
+                return None;
+            }
+            continue;
+        }
+        let a = (minimum_axis - origin_axis) / direction_axis;
+        let b = (maximum_axis - origin_axis) / direction_axis;
+        entry = entry.max(a.min(b));
+        exit = exit.min(a.max(b));
+    }
+    (exit >= entry.max(0.0)).then_some((entry, exit))
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2259,8 +2316,11 @@ struct Uniforms {
     detail_ring: [f32; 4],
     // LOD grid side, LOD count, unused, camera aspect ratio
     lod_world: [f32; 4],
-    // elapsed world time, forest-TLAS root plus one (zero = empty), detailed world height, unused
+    // elapsed world time, forest-TLAS root plus one (zero = empty), detailed world height, ambient-only flag
     simulation: [f32; 4],
+    // Selected block/slab AABB. selection_min.w is one when a block is selected.
+    selection_min: [f32; 4],
+    selection_max: [f32; 4],
 }
 
 impl Uniforms {
@@ -2275,6 +2335,8 @@ impl Uniforms {
             detail_ring: [0.0; 4],
             lod_world: [0.0; 4],
             simulation: [0.0; 4],
+            selection_min: [0.0; 4],
+            selection_max: [0.0; 4],
         }
     }
 }
@@ -2298,6 +2360,10 @@ struct World {
     /// Chunk-major physical storage. A whole chunk is contiguous, so a stream
     /// update writes one range rather than repacking the full 9×9 window.
     detailed_blocks: Vec<Block>,
+    /// Exact, three-level occupancy map for `detailed_blocks`.  It has one
+    /// bit per block, per 4³ brick, and per 16³ chunk layer; every level is
+    /// rebuilt from the same packed blocks that the shader intersects.
+    detail_occupancy: Vec<u32>,
     lod_samples: Vec<u32>,
     lod_levels: [GpuLodLevel; LOD_LEVEL_COUNT],
     lod_tree: LodQuadTree,
@@ -2349,6 +2415,7 @@ impl World {
             detail_origin: ChunkPos { x: 0, z: 0 },
             detail_ring: (0, 0),
             detailed_blocks: vec![AIR; DETAIL_CHUNK_COUNT * CHUNK_BLOCK_COUNT],
+            detail_occupancy: vec![0; DETAIL_OCCUPANCY_WORDS],
             lod_samples: vec![0; LOD_SAMPLE_COUNT],
             lod_levels: [GpuLodLevel::zeroed(); LOD_LEVEL_COUNT],
             lod_tree: LodQuadTree::new(),
@@ -2703,6 +2770,139 @@ impl World {
             + CHUNK_SIZE as usize * (local_z + CHUNK_SIZE as usize * cell.y as usize)
     }
 
+    fn block_at_world_cell(&self, cell: IVec3) -> Block {
+        let Some(slot) = self.slot_for_world_cell(cell) else {
+            return AIR;
+        };
+        self.detailed_blocks[Self::block_index_in_slot(slot, cell)]
+    }
+
+    /// Wood is rendered from the Dynamic Trees graph as HPD segments rather
+    /// than being copied into `detailed_blocks`. Keep its authoritative branch
+    /// cells available to the Minecraft-style block picker as well.
+    fn tree_branch_at_world_cell(&self, cell: IVec3) -> bool {
+        self.detailed.values().any(|chunk| {
+            chunk
+                .chunk
+                .trees
+                .iter()
+                .any(|tree| tree.branches.contains_key(&cell))
+        })
+    }
+
+    /// Finds the first detailed block/slab under the centre-screen ray. The
+    /// traversal is a single exact 1³ DDA; it intentionally shares the same
+    /// packed block data and 1/16th AABBs as the GPU renderer.
+    fn select_block(&self, origin: Vec3, direction: Vec3) -> Option<BlockSelection> {
+        let world_minimum = Vec3::new(
+            (self.detail_origin.x * CHUNK_SIZE) as f32,
+            0.0,
+            (self.detail_origin.z * CHUNK_SIZE) as f32,
+        );
+        let world_maximum = world_minimum
+            + Vec3::new(
+                (DETAIL_DIAMETER * CHUNK_SIZE) as f32,
+                WORLD_HEIGHT as f32,
+                (DETAIL_DIAMETER * CHUNK_SIZE) as f32,
+            );
+        let (window_entry, window_exit) =
+            ray_aabb_interval_cpu(origin, direction, world_minimum, world_maximum)?;
+        let maximum_distance = window_exit.min(BLOCK_SELECTION_DISTANCE);
+        let start_distance = window_entry.max(0.0) + 0.0001;
+        if start_distance >= maximum_distance {
+            return None;
+        }
+
+        let ray_start = origin + direction * start_distance;
+        let mut cell = ray_start.floor().as_ivec3();
+        let safe_direction = Vec3::new(
+            if direction.x.abs() <= 1.0e-6 {
+                1.0e-6
+            } else {
+                direction.x
+            },
+            if direction.y.abs() <= 1.0e-6 {
+                1.0e-6
+            } else {
+                direction.y
+            },
+            if direction.z.abs() <= 1.0e-6 {
+                1.0e-6
+            } else {
+                direction.z
+            },
+        );
+        let step = IVec3::new(
+            if direction.x >= 0.0 { 1 } else { -1 },
+            if direction.y >= 0.0 { 1 } else { -1 },
+            if direction.z >= 0.0 { 1 } else { -1 },
+        );
+        let delta = safe_direction.recip().abs();
+        let mut side = Vec3::new(
+            if direction.x >= 0.0 {
+                start_distance + ((cell.x + 1) as f32 - ray_start.x) * delta.x
+            } else {
+                start_distance + (ray_start.x - cell.x as f32) * delta.x
+            },
+            if direction.y >= 0.0 {
+                start_distance + ((cell.y + 1) as f32 - ray_start.y) * delta.y
+            } else {
+                start_distance + (ray_start.y - cell.y as f32) * delta.y
+            },
+            if direction.z >= 0.0 {
+                start_distance + ((cell.z + 1) as f32 - ray_start.z) * delta.z
+            } else {
+                start_distance + (ray_start.z - cell.z as f32) * delta.z
+            },
+        );
+        let mut entered = start_distance;
+        for _ in 0..64 {
+            if entered > maximum_distance {
+                break;
+            }
+            let cell_exit = side.min_element();
+            let packed = self.block_at_world_cell(cell);
+            let contains_tree_wood = packed == AIR && self.tree_branch_at_world_cell(cell);
+            if packed != AIR || contains_tree_wood {
+                // A rendered branch owns a normal DT block cell, even though
+                // its visible Eco Machina prism is thinner than a voxel. The
+                // selection frame intentionally encloses that logical cell,
+                // matching Minecraft/Dynamic Trees interaction semantics.
+                let height = if packed == AIR {
+                    1.0
+                } else {
+                    ((packed >> 8) & 255) as f32 / 16.0
+                };
+                let minimum = cell.as_vec3();
+                let maximum = minimum + Vec3::new(1.0, height, 1.0);
+                if let Some((entry, exit)) =
+                    ray_aabb_interval_cpu(origin, direction, minimum, maximum)
+                    && entry <= cell_exit + 0.002
+                    && exit >= entered - 0.002
+                    && entry.max(0.0) <= maximum_distance
+                {
+                    return Some(BlockSelection {
+                        cell,
+                        minimum,
+                        maximum,
+                    });
+                }
+            }
+            entered = cell_exit;
+            if side.x <= side.y && side.x <= side.z {
+                side.x += delta.x;
+                cell.x += step.x;
+            } else if side.y <= side.z {
+                side.y += delta.y;
+                cell.y += step.y;
+            } else {
+                side.z += delta.z;
+                cell.z += step.z;
+            }
+        }
+        None
+    }
+
     fn reset_slot_to_terrain(&mut self, slot: usize) {
         let position = self.slot_positions[slot].expect("active ring slot has a position");
         let chunk = &self
@@ -2712,6 +2912,54 @@ impl World {
             .chunk;
         let start = slot * CHUNK_BLOCK_COUNT;
         self.detailed_blocks[start..start + CHUNK_BLOCK_COUNT].copy_from_slice(&chunk.blocks);
+    }
+
+    fn set_occupancy_bit(&mut self, bit: usize) {
+        self.detail_occupancy[bit / 32] |= 1 << (bit % 32);
+    }
+
+    fn clear_occupancy_bit(&mut self, bit: usize) {
+        self.detail_occupancy[bit / 32] &= !(1 << (bit % 32));
+    }
+
+    /// Rebuilds all exact occupancy levels for one physical ring slot after
+    /// terrain and its Dynamic Trees leaf/root overlays have been composed.
+    /// No heuristic is involved: a set bit always corresponds to a non-air
+    /// packed block which the fine DDA will still test normally.
+    fn rebuild_occupancy_slot(&mut self, slot: usize) {
+        let fine_start = slot * DETAIL_FINE_OCCUPANCY_WORDS_PER_CHUNK;
+        self.detail_occupancy[fine_start..fine_start + DETAIL_FINE_OCCUPANCY_WORDS_PER_CHUNK]
+            .fill(0);
+        let brick_start =
+            DETAIL_BRICK_OCCUPANCY_OFFSET + slot * DETAIL_BRICK_OCCUPANCY_WORDS_PER_CHUNK;
+        self.detail_occupancy[brick_start..brick_start + DETAIL_BRICK_OCCUPANCY_WORDS_PER_CHUNK]
+            .fill(0);
+        let coarse_bit_start =
+            DETAIL_COARSE_OCCUPANCY_OFFSET * 32 + slot * (WORLD_HEIGHT / CHUNK_SIZE) as usize;
+        for local_y in 0..(WORLD_HEIGHT / CHUNK_SIZE) as usize {
+            self.clear_occupancy_bit(coarse_bit_start + local_y);
+        }
+
+        let block_start = slot * CHUNK_BLOCK_COUNT;
+        for local_y in 0..WORLD_HEIGHT as usize {
+            for local_z in 0..CHUNK_SIZE as usize {
+                for local_x in 0..CHUNK_SIZE as usize {
+                    let local_index =
+                        local_x + CHUNK_SIZE as usize * (local_z + CHUNK_SIZE as usize * local_y);
+                    if self.detailed_blocks[block_start + local_index] == AIR {
+                        continue;
+                    }
+                    self.set_occupancy_bit(block_start + local_index);
+                    let brick_index = (local_x / DETAIL_BRICK_SIZE as usize)
+                        + (CHUNK_SIZE / DETAIL_BRICK_SIZE) as usize
+                            * ((local_z / DETAIL_BRICK_SIZE as usize)
+                                + (CHUNK_SIZE / DETAIL_BRICK_SIZE) as usize
+                                    * (local_y / DETAIL_BRICK_SIZE as usize));
+                    self.set_occupancy_bit(brick_start * 32 + brick_index);
+                    self.set_occupancy_bit(coarse_bit_start + local_y / CHUNK_SIZE as usize);
+                }
+            }
+        }
     }
 
     fn repaint_tree_voxels(&mut self, initial_slots: &[usize], changes: &mut WorldChanges) {
@@ -2750,6 +2998,9 @@ impl World {
                     self.detailed_blocks[index] = block(material, 16);
                 }
             }
+        }
+        for &slot in &slots {
+            self.rebuild_occupancy_slot(slot);
         }
         changes.detail_slots.extend(slots.drain());
         changes.detail_slots.sort_unstable();
@@ -3371,6 +3622,12 @@ impl Camera {
         self.forward().cross(Vec3::Y).normalize()
     }
 
+    fn rotate_by_mouse(&mut self, delta: Vec2) {
+        const MOUSE_SENSITIVITY: f32 = 0.0025;
+        self.yaw += delta.x * MOUSE_SENSITIVITY;
+        self.pitch = (self.pitch - delta.y * MOUSE_SENSITIVITY).clamp(-1.45, 1.45);
+    }
+
     fn move_with_keys(&mut self, keys: &HashSet<KeyCode>, delta: f32) {
         let mut movement = Vec3::ZERO;
         let forward = self.forward();
@@ -3418,14 +3675,15 @@ impl Camera {
     }
 }
 
-// `wgpu` only exposes portable timing around command-encoder/render-pass
-// boundaries.  A ray tracer implemented as one fragment pass therefore has
-// one honest in-engine GPU scope; shader-instruction analysis remains the job
-// of PIX/Nsight, where these pass labels are visible.
+// `wgpu` exposes portable timing at render-pass boundaries.  The renderer is
+// therefore intentionally split into primary rays, sun-shadow rays and final
+// composition, giving production captures honest GPU timings for each stage.
 #[cfg(feature = "profiling")]
 const GPU_PROFILER_TIMESTAMP_RING_SIZE: usize = 6;
 #[cfg(feature = "profiling")]
-const GPU_PROFILER_QUERIES_PER_FRAME: u32 = 2;
+const GPU_PROFILER_PASSES_PER_FRAME: u32 = 3;
+#[cfg(feature = "profiling")]
+const GPU_PROFILER_QUERIES_PER_FRAME: u32 = GPU_PROFILER_PASSES_PER_FRAME * 2;
 #[cfg(feature = "profiling")]
 const GPU_PROFILER_HISTORY_SIZE: usize = 180;
 #[cfg(feature = "profiling")]
@@ -3436,6 +3694,14 @@ const GPU_PROFILER_RESOLVE_STRIDE: u64 = wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
 struct GpuTimestampFrame {
     readback_slot: usize,
     first_query: u32,
+}
+
+#[cfg(feature = "profiling")]
+#[derive(Clone, Copy)]
+enum GpuProfilePass {
+    PrimaryRays = 0,
+    SunShadows = 1,
+    Lighting = 2,
 }
 
 #[cfg(feature = "profiling")]
@@ -3481,7 +3747,7 @@ impl RollingTimings {
     }
 }
 
-/// Timestamp-query manager for the full GPU ray-tracing pass. Query results
+/// Timestamp-query manager for the three GPU rendering stages. Query results
 /// are copied into a six-frame ring and mapped only after the GPU completes;
 /// neither profiling nor a slow capture client is allowed to block rendering.
 #[cfg(feature = "profiling")]
@@ -3493,7 +3759,9 @@ struct GpuPassProfiler {
     completed_receiver: mpsc::Receiver<GpuTimestampCompletion>,
     timestamp_period_ns: f64,
     next_readback_slot: usize,
-    timings: RollingTimings,
+    primary_timings: RollingTimings,
+    shadow_timings: RollingTimings,
+    lighting_timings: RollingTimings,
     discarded_samples: u64,
 }
 
@@ -3533,7 +3801,9 @@ impl GpuPassProfiler {
             completed_receiver,
             timestamp_period_ns: f64::from(queue.get_timestamp_period()),
             next_readback_slot: 0,
-            timings: RollingTimings::default(),
+            primary_timings: RollingTimings::default(),
+            shadow_timings: RollingTimings::default(),
+            lighting_timings: RollingTimings::default(),
             discarded_samples: 0,
         }
     }
@@ -3557,11 +3827,16 @@ impl GpuPassProfiler {
         None
     }
 
-    fn timestamp_writes(&self, frame: GpuTimestampFrame) -> wgpu::RenderPassTimestampWrites<'_> {
+    fn timestamp_writes(
+        &self,
+        frame: GpuTimestampFrame,
+        pass: GpuProfilePass,
+    ) -> wgpu::RenderPassTimestampWrites<'_> {
+        let first_query = frame.first_query + pass as u32 * 2;
         wgpu::RenderPassTimestampWrites {
             query_set: &self.query_set,
-            beginning_of_pass_write_index: Some(frame.first_query),
-            end_of_pass_write_index: Some(frame.first_query + 1),
+            beginning_of_pass_write_index: Some(first_query),
+            end_of_pass_write_index: Some(first_query + 1),
         }
     }
 
@@ -3610,12 +3885,19 @@ impl GpuPassProfiler {
                 continue;
             }
             let timestamps = match readback.buffer.get_mapped_range(..) {
-                Ok(bytes) if bytes.len() == 16 => {
-                    let begin = u64::from_le_bytes(bytes[0..8].try_into().expect("timestamp size"));
-                    let end = u64::from_le_bytes(bytes[8..16].try_into().expect("timestamp size"));
+                Ok(bytes)
+                    if bytes.len()
+                        == GPU_PROFILER_QUERIES_PER_FRAME as usize * std::mem::size_of::<u64>() =>
+                {
+                    let timestamps = bytes
+                        .chunks_exact(std::mem::size_of::<u64>())
+                        .map(|timestamp| {
+                            u64::from_le_bytes(timestamp.try_into().expect("timestamp size"))
+                        })
+                        .collect::<Vec<_>>();
                     drop(bytes);
                     readback.buffer.unmap();
-                    Some((begin, end))
+                    Some(timestamps)
                 }
                 Ok(bytes) => {
                     drop(bytes);
@@ -3624,30 +3906,67 @@ impl GpuPassProfiler {
                 }
                 Err(_) => None,
             };
-            let Some((begin, end)) = timestamps else {
+            let Some(timestamps) = timestamps else {
                 self.discarded_samples += 1;
                 continue;
             };
-            // Timestamp absolute values may wrap. A negative interval is not
-            // a useful performance sample and is deliberately discarded.
-            if end < begin {
-                self.discarded_samples += 1;
-                continue;
+            self.record_stage_sample(
+                timestamps[GpuProfilePass::PrimaryRays as usize * 2],
+                timestamps[GpuProfilePass::PrimaryRays as usize * 2 + 1],
+                GpuProfilePass::PrimaryRays,
+            );
+            self.record_stage_sample(
+                timestamps[GpuProfilePass::SunShadows as usize * 2],
+                timestamps[GpuProfilePass::SunShadows as usize * 2 + 1],
+                GpuProfilePass::SunShadows,
+            );
+            self.record_stage_sample(
+                timestamps[GpuProfilePass::Lighting as usize * 2],
+                timestamps[GpuProfilePass::Lighting as usize * 2 + 1],
+                GpuProfilePass::Lighting,
+            );
+        }
+    }
+
+    fn record_stage_sample(&mut self, begin: u64, end: u64, pass: GpuProfilePass) {
+        // Timestamp absolute values may wrap. A negative interval is not a
+        // useful performance sample and is deliberately discarded.
+        if end < begin {
+            self.discarded_samples += 1;
+            return;
+        }
+        let milliseconds = (end - begin) as f64 * self.timestamp_period_ns / 1_000_000.0;
+        if !milliseconds.is_finite() || !(0.0..=1_000.0).contains(&milliseconds) {
+            self.discarded_samples += 1;
+            return;
+        }
+        match pass {
+            GpuProfilePass::PrimaryRays => {
+                self.primary_timings.record(milliseconds);
+                tracy_client::plot!("GPU primary rays (ms)", milliseconds);
             }
-            let milliseconds = (end - begin) as f64 * self.timestamp_period_ns / 1_000_000.0;
-            if !milliseconds.is_finite() || !(0.0..=1_000.0).contains(&milliseconds) {
-                self.discarded_samples += 1;
-                continue;
+            GpuProfilePass::SunShadows => {
+                self.shadow_timings.record(milliseconds);
+                tracy_client::plot!("GPU sun shadows (ms)", milliseconds);
             }
-            self.timings.record(milliseconds);
-            tracy_client::plot!("GPU Raytrace (ms)", milliseconds);
+            GpuProfilePass::Lighting => {
+                self.lighting_timings.record(milliseconds);
+                tracy_client::plot!("GPU lighting (ms)", milliseconds);
+            }
         }
     }
 
     fn summary(&self) -> String {
-        match (self.timings.average(), self.timings.percentile(0.95)) {
-            (Some(average), Some(p95)) => format!("GPU ray {average:.2} ms · p95 {p95:.2} ms"),
-            _ => "GPU ray collecting…".to_owned(),
+        match (
+            self.primary_timings.average(),
+            self.primary_timings.percentile(0.95),
+            self.shadow_timings.average(),
+            self.lighting_timings.average(),
+        ) {
+            (Some(primary), Some(primary_p95), Some(shadow), Some(lighting)) => format!(
+                "GPU primary {primary:.2} ms (p95 {primary_p95:.2}) · shadow {shadow:.2} ms · light {lighting:.2} ms"
+            ),
+            _ => "GPU stages collecting…".to_owned(),
         }
     }
 }
@@ -3658,29 +3977,475 @@ struct State {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
-    pipeline: wgpu::RenderPipeline,
-    bind_group: wgpu::BindGroup,
+    primary_pipeline: wgpu::RenderPipeline,
+    shadow_pipeline: wgpu::RenderPipeline,
+    lighting_pipeline: wgpu::RenderPipeline,
+    scene_bind_group: wgpu::BindGroup,
+    shadow_bind_group_layout: wgpu::BindGroupLayout,
+    shadow_bind_group: wgpu::BindGroup,
+    full_bind_group_layout: wgpu::BindGroupLayout,
+    full_bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     detail_buffer: wgpu::Buffer,
+    detail_occupancy_buffer: wgpu::Buffer,
     lod_buffer: wgpu::Buffer,
     lod_info_buffer: wgpu::Buffer,
     tree_buffer: wgpu::Buffer,
     tree_segment_buffer: wgpu::Buffer,
     tree_blas_buffer: wgpu::Buffer,
     tree_tlas_buffer: wgpu::Buffer,
+    _tree_texture: wgpu::Texture,
+    tree_texture_view: wgpu::TextureView,
+    tree_texture_sampler: wgpu::Sampler,
+    ray_gbuffer: RayGBuffer,
     camera: Camera,
     world: World,
     world_time: f32,
+    selected_block: Option<BlockSelection>,
+    ambient_only: bool,
+    ui: InGameUi,
     #[cfg(feature = "profiling")]
     gpu_profiler: Option<GpuPassProfiler>,
 }
 
+/// Native egui integration owned by the game renderer.  It shares the existing
+/// wgpu device and surface, so opening the menu never creates a second window
+/// or a second graphics context.
+struct InGameUi {
+    context: egui::Context,
+    input: egui_winit::State,
+    renderer: egui_wgpu::Renderer,
+    paint_jobs: Vec<egui::ClippedPrimitive>,
+    textures_to_free: Vec<egui::TextureId>,
+    screen: egui_wgpu::ScreenDescriptor,
+    visible: bool,
+}
+
+impl InGameUi {
+    fn new(device: &wgpu::Device, output_format: wgpu::TextureFormat, window: &Window) -> Self {
+        let context = egui::Context::default();
+        context.set_visuals(egui::Visuals::dark());
+        let input = egui_winit::State::new(
+            context.clone(),
+            egui::ViewportId::ROOT,
+            window,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            None,
+        );
+        Self {
+            context,
+            input,
+            renderer: egui_wgpu::Renderer::new(
+                device,
+                output_format,
+                egui_wgpu::RendererOptions::default(),
+            ),
+            paint_jobs: Vec::new(),
+            textures_to_free: Vec::new(),
+            screen: egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [window.inner_size().width, window.inner_size().height],
+                pixels_per_point: window.scale_factor() as f32,
+            },
+            visible: false,
+        }
+    }
+
+    fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
+        self.visible && self.input.on_window_event(window, event).consumed
+    }
+
+    /// Builds a menu frame before the world uniforms are uploaded.  Returning
+    /// true asks the application to lock the pointer again after this frame.
+    fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        window: &Window,
+        ambient_only: &mut bool,
+        selection: Option<BlockSelection>,
+    ) -> bool {
+        let raw_input = self.input.take_egui_input(window);
+        let mut resume_game = false;
+        let egui::FullOutput {
+            platform_output,
+            mut textures_delta,
+            shapes,
+            pixels_per_point,
+            ..
+        } = self.context.run_ui(raw_input, |context| {
+            if let Some(selection) = selection {
+                egui::Area::new(egui::Id::new("selected voxel coordinates"))
+                    .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(16.0, -16.0))
+                    .interactable(false)
+                    .show(context, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(format!(
+                                "Selected voxel: X {}  Y {}  Z {}",
+                                selection.cell.x, selection.cell.y, selection.cell.z,
+                            ))
+                            .monospace()
+                            .strong()
+                            .color(egui::Color32::WHITE)
+                            .background_color(egui::Color32::from_black_alpha(190)))
+                            .extend(),
+                        );
+                    });
+            }
+            if self.visible {
+                egui::Window::new("RayVoxel")
+                    .default_pos(egui::pos2(16.0, 16.0))
+                    .default_width(300.0)
+                    .resizable(false)
+                    .collapsible(false)
+                    .show(context, |ui| {
+                        ui.heading("Renderer");
+                        ui.separator();
+                        ui.checkbox(ambient_only, "Ambient only");
+                        ui.small(
+                            "Constant material lighting. Disables the sun, direct shadows, day/night tint and distance fog.",
+                        );
+                        ui.separator();
+                        ui.label("F1 — close/open this panel");
+                        ui.label("L — toggle Ambient only");
+                        if ui.button("Resume game").clicked() {
+                            resume_game = true;
+                        }
+                    });
+            }
+        });
+        self.input.handle_platform_output(window, platform_output);
+        for (texture_id, image_deltas) in &textures_delta.set {
+            for image_delta in image_deltas {
+                self.renderer
+                    .update_texture(device, queue, *texture_id, image_delta);
+            }
+        }
+        self.paint_jobs = self.context.tessellate(shapes, pixels_per_point);
+        self.textures_to_free = textures_delta.free.iter().copied().collect();
+        // We copied all free IDs and uploaded every set delta above.  Newer
+        // egui versions enforce that integrations explicitly acknowledge this
+        // hand-off before TexturesDelta is dropped.
+        textures_delta.clear();
+        self.screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [window.inner_size().width, window.inner_size().height],
+            pixels_per_point,
+        };
+        if resume_game {
+            self.visible = false;
+        }
+        resume_game
+    }
+
+    fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let user_command_buffers =
+            self.renderer
+                .update_buffers(device, queue, encoder, &self.paint_jobs, &self.screen);
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("RayVoxel::egui overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.renderer
+                .render(&mut pass.forget_lifetime(), &self.paint_jobs, &self.screen);
+        }
+        for texture_id in self.textures_to_free.drain(..) {
+            self.renderer.free_texture(&texture_id);
+        }
+        user_command_buffers
+    }
+}
+
+/// Lossless deferred hand-off between tracing and shading.  All hit values
+/// that affect the final image remain f32; the shadow target is an integer
+/// boolean so its 0.24 lighting factor is reconstructed exactly.
+struct RayGBuffer {
+    _geometry_texture: wgpu::Texture,
+    geometry_view: wgpu::TextureView,
+    _surface_texture: wgpu::Texture,
+    surface_view: wgpu::TextureView,
+    _shadow_texture: wgpu::Texture,
+    shadow_view: wgpu::TextureView,
+}
+
+impl RayGBuffer {
+    fn new(device: &wgpu::Device, size: PhysicalSize<u32>) -> Self {
+        let extent = wgpu::Extent3d {
+            width: size.width.max(1),
+            height: size.height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let make_target = |label, format| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (texture, view)
+        };
+        let (geometry_texture, geometry_view) = make_target(
+            "RayVoxel::primary geometry G-buffer",
+            wgpu::TextureFormat::Rgba32Float,
+        );
+        let (surface_texture, surface_view) = make_target(
+            "RayVoxel::primary surface G-buffer",
+            wgpu::TextureFormat::Rgba32Float,
+        );
+        let (shadow_texture, shadow_view) =
+            make_target("RayVoxel::sun shadow mask", wgpu::TextureFormat::R8Uint);
+        Self {
+            _geometry_texture: geometry_texture,
+            geometry_view,
+            _surface_texture: surface_texture,
+            surface_view,
+            _shadow_texture: shadow_texture,
+            shadow_view,
+        }
+    }
+}
+
+fn scene_bind_group_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
+    vec![
+        buffer_layout_entry(0, wgpu::BufferBindingType::Uniform),
+        buffer_layout_entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
+        buffer_layout_entry(2, wgpu::BufferBindingType::Storage { read_only: true }),
+        buffer_layout_entry(3, wgpu::BufferBindingType::Storage { read_only: true }),
+        buffer_layout_entry(4, wgpu::BufferBindingType::Storage { read_only: true }),
+        buffer_layout_entry(5, wgpu::BufferBindingType::Storage { read_only: true }),
+        wgpu::BindGroupLayoutEntry {
+            binding: 6,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                multisampled: false,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 7,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
+        buffer_layout_entry(8, wgpu::BufferBindingType::Storage { read_only: true }),
+        buffer_layout_entry(9, wgpu::BufferBindingType::Storage { read_only: true }),
+        buffer_layout_entry(10, wgpu::BufferBindingType::Storage { read_only: true }),
+    ]
+}
+
+fn unfilterable_float_texture_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            multisampled: false,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+        },
+        count: None,
+    }
+}
+
+fn uint_texture_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            multisampled: false,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            sample_type: wgpu::TextureSampleType::Uint,
+        },
+        count: None,
+    }
+}
+
+fn fullscreen_pipeline(
+    device: &wgpu::Device,
+    label: &'static str,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    entry_point: &'static str,
+    targets: &[Option<wgpu::ColorTargetState>],
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(entry_point),
+            targets,
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 impl State {
+    fn rebuild_post_trace_resources(&mut self) {
+        self.ray_gbuffer = RayGBuffer::new(&self.device, self.size);
+        self.shadow_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ray world shadow bind group"),
+            layout: &self.shadow_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.detail_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.lod_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.tree_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lod_info_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.tree_segment_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&self.tree_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&self.tree_texture_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.tree_blas_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.tree_tlas_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: self.detail_occupancy_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(&self.ray_gbuffer.geometry_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&self.ray_gbuffer.surface_view),
+                },
+            ],
+        });
+        self.full_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ray world post-trace bind group"),
+            layout: &self.full_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.detail_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.lod_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.tree_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.lod_info_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.tree_segment_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&self.tree_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&self.tree_texture_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: self.tree_blas_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: self.tree_tlas_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: self.detail_occupancy_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(&self.ray_gbuffer.geometry_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&self.ray_gbuffer.surface_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(&self.ray_gbuffer.shadow_view),
+                },
+            ],
+        });
+    }
+
     async fn new(window: Arc<Window>) -> Result<Self, String> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance
-            .create_surface(window)
+            .create_surface(window.clone())
             .map_err(|error| format!("could not create the rendering surface: {error}"))?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -3691,6 +4456,22 @@ impl State {
             })
             .await
             .map_err(|error| format!("no suitable graphics adapter: {error}"))?;
+        for (format, label) in [
+            (wgpu::TextureFormat::Rgba32Float, "32-bit float G-buffer"),
+            (wgpu::TextureFormat::R8Uint, "integer sun-shadow mask"),
+        ] {
+            let required =
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+            if !adapter
+                .get_texture_format_features(format)
+                .allowed_usages
+                .contains(required)
+            {
+                return Err(format!(
+                    "selected GPU does not support the required {label} texture format ({format:?})"
+                ));
+            }
+        }
         let profiling_timestamps_supported = cfg!(feature = "profiling")
             && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let (device, queue) = adapter
@@ -3725,6 +4506,11 @@ impl State {
             "streamed detailed voxel chunks",
             &world.detailed_blocks,
         );
+        let detail_occupancy_buffer = storage_buffer(
+            &device,
+            "exact detailed voxel occupancy hierarchy",
+            &world.detail_occupancy,
+        );
         let lod_buffer = storage_buffer(
             &device,
             "Distant Horizons full-data columns",
@@ -3754,41 +4540,19 @@ impl State {
         #[cfg(feature = "profiling")]
         let gpu_profiler =
             profiling_timestamps_supported.then(|| GpuPassProfiler::new(&device, &queue));
-        let (_tree_texture, tree_texture_view, tree_texture_sampler) =
+        let (tree_texture, tree_texture_view, tree_texture_sampler) =
             create_tree_texture(&device, &queue);
+        let ray_gbuffer = RayGBuffer::new(&device, size);
+        let ui = InGameUi::new(&device, config.format, window.as_ref());
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ray world bind group layout"),
-            entries: &[
-                buffer_layout_entry(0, wgpu::BufferBindingType::Uniform),
-                buffer_layout_entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer_layout_entry(2, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer_layout_entry(3, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer_layout_entry(4, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer_layout_entry(5, wgpu::BufferBindingType::Storage { read_only: true }),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                buffer_layout_entry(8, wgpu::BufferBindingType::Storage { read_only: true }),
-                buffer_layout_entry(9, wgpu::BufferBindingType::Storage { read_only: true }),
-            ],
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let scene_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ray world bind group layout"),
+                entries: &scene_bind_group_entries(),
+            });
+        let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ray world bind group"),
-            layout: &bind_group_layout,
+            layout: &scene_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -3830,42 +4594,218 @@ impl State {
                     binding: 9,
                     resource: tree_tlas_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: detail_occupancy_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut shadow_bind_group_entries = scene_bind_group_entries();
+        shadow_bind_group_entries.extend([
+            unfilterable_float_texture_layout_entry(11),
+            unfilterable_float_texture_layout_entry(12),
+        ]);
+        let shadow_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ray world shadow bind group layout"),
+                entries: &shadow_bind_group_entries,
+            });
+        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ray world shadow bind group"),
+            layout: &shadow_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: detail_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: lod_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tree_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: lod_info_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: tree_segment_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&tree_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&tree_texture_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: tree_blas_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: tree_tlas_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: detail_occupancy_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(&ray_gbuffer.geometry_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&ray_gbuffer.surface_view),
+                },
+            ],
+        });
+        let mut full_bind_group_entries = scene_bind_group_entries();
+        full_bind_group_entries.extend([
+            unfilterable_float_texture_layout_entry(11),
+            unfilterable_float_texture_layout_entry(12),
+            uint_texture_layout_entry(13),
+        ]);
+        let full_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ray world post-trace bind group layout"),
+                entries: &full_bind_group_entries,
+            });
+        let full_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ray world post-trace bind group"),
+            layout: &full_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: detail_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: lod_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tree_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: lod_info_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: tree_segment_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&tree_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&tree_texture_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: tree_blas_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: tree_tlas_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: detail_occupancy_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::TextureView(&ray_gbuffer.geometry_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&ray_gbuffer.surface_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(&ray_gbuffer.shadow_view),
+                },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("DDA ray tracing shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("ray world pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ray-traced voxel pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+        let primary_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ray primary pipeline layout"),
+                bind_group_layouts: &[Some(&scene_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ray shadow pipeline layout"),
+                bind_group_layouts: &[Some(&shadow_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let lighting_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ray lighting pipeline layout"),
+                bind_group_layouts: &[Some(&full_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let primary_pipeline = fullscreen_pipeline(
+            &device,
+            "RayVoxel::Primary rays",
+            &primary_pipeline_layout,
+            &shader,
+            "fs_primary",
+            &[
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+        );
+        let shadow_pipeline = fullscreen_pipeline(
+            &device,
+            "RayVoxel::Sun shadows",
+            &shadow_pipeline_layout,
+            &shader,
+            "fs_sun_shadow",
+            &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R8Uint,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        );
+        let lighting_pipeline = fullscreen_pipeline(
+            &device,
+            "RayVoxel::Lighting composition",
+            &lighting_pipeline_layout,
+            &shader,
+            "fs_lighting",
+            &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        );
 
         Ok(Self {
             surface,
@@ -3873,19 +4813,33 @@ impl State {
             queue,
             config,
             size,
-            pipeline,
-            bind_group,
+            primary_pipeline,
+            shadow_pipeline,
+            lighting_pipeline,
+            scene_bind_group,
+            shadow_bind_group_layout,
+            shadow_bind_group,
+            full_bind_group_layout,
+            full_bind_group,
             uniform_buffer,
             detail_buffer,
+            detail_occupancy_buffer,
             lod_buffer,
             lod_info_buffer,
             tree_buffer,
             tree_segment_buffer,
             tree_blas_buffer,
             tree_tlas_buffer,
+            _tree_texture: tree_texture,
+            tree_texture_view,
+            tree_texture_sampler,
+            ray_gbuffer,
             camera,
             world,
             world_time: 18.0,
+            selected_block: None,
+            ambient_only: false,
+            ui,
             #[cfg(feature = "profiling")]
             gpu_profiler,
         })
@@ -3899,6 +4853,34 @@ impl State {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        self.rebuild_post_trace_resources();
+    }
+
+    fn ui_visible(&self) -> bool {
+        self.ui.visible
+    }
+
+    fn toggle_ui(&mut self) -> bool {
+        self.ui.visible = !self.ui.visible;
+        self.ui.visible
+    }
+
+    fn close_ui(&mut self) {
+        self.ui.visible = false;
+    }
+
+    fn toggle_ambient_only(&mut self) {
+        self.ambient_only = !self.ambient_only;
+    }
+
+    fn prepare_ui(&mut self, window: &Window) -> bool {
+        self.ui.prepare(
+            &self.device,
+            &self.queue,
+            window,
+            &mut self.ambient_only,
+            self.selected_block,
+        )
     }
 
     fn update(&mut self, keys: &HashSet<KeyCode>, seconds: f32) {
@@ -3918,6 +4900,34 @@ impl State {
                 (block_start * std::mem::size_of::<Block>()) as u64,
                 bytemuck::cast_slice(
                     &self.world.detailed_blocks[block_start..block_start + CHUNK_BLOCK_COUNT],
+                ),
+            );
+            let fine_word_start = *slot * DETAIL_FINE_OCCUPANCY_WORDS_PER_CHUNK;
+            self.queue.write_buffer(
+                &self.detail_occupancy_buffer,
+                (fine_word_start * std::mem::size_of::<u32>()) as u64,
+                bytemuck::cast_slice(
+                    &self.world.detail_occupancy
+                        [fine_word_start..fine_word_start + DETAIL_FINE_OCCUPANCY_WORDS_PER_CHUNK],
+                ),
+            );
+            let brick_word_start =
+                DETAIL_BRICK_OCCUPANCY_OFFSET + *slot * DETAIL_BRICK_OCCUPANCY_WORDS_PER_CHUNK;
+            self.queue.write_buffer(
+                &self.detail_occupancy_buffer,
+                (brick_word_start * std::mem::size_of::<u32>()) as u64,
+                bytemuck::cast_slice(
+                    &self.world.detail_occupancy[brick_word_start
+                        ..brick_word_start + DETAIL_BRICK_OCCUPANCY_WORDS_PER_CHUNK],
+                ),
+            );
+        }
+        if !stream_changes.detail_slots.is_empty() {
+            self.queue.write_buffer(
+                &self.detail_occupancy_buffer,
+                (DETAIL_COARSE_OCCUPANCY_OFFSET * std::mem::size_of::<u32>()) as u64,
+                bytemuck::cast_slice(
+                    &self.world.detail_occupancy[DETAIL_COARSE_OCCUPANCY_OFFSET..],
                 ),
             );
         }
@@ -3986,6 +4996,7 @@ impl State {
         let forward = self.camera.forward();
         let right = self.camera.right();
         let up = right.cross(forward).normalize();
+        self.selected_block = self.world.select_block(self.camera.position, forward);
         let mut uniforms = Uniforms::new();
         uniforms.camera_position = self.camera.position.extend(1.0).to_array();
         uniforms.camera_forward = forward.extend(0.0).to_array();
@@ -4016,8 +5027,22 @@ impl State {
                 .tree_tlas_root
                 .map_or(0.0, |root| root as f32 + 1.0),
             WORLD_HEIGHT as f32,
-            0.0,
+            if self.ambient_only { 1.0 } else { 0.0 },
         ];
+        if let Some(selection) = self.selected_block {
+            uniforms.selection_min = [
+                selection.minimum.x,
+                selection.minimum.y,
+                selection.minimum.z,
+                1.0,
+            ];
+            uniforms.selection_max = [
+                selection.maximum.x,
+                selection.maximum.y,
+                selection.maximum.z,
+                0.0,
+            ];
+        }
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -4044,15 +5069,6 @@ impl State {
             .gpu_profiler
             .as_mut()
             .and_then(GpuPassProfiler::reserve_frame);
-        #[cfg(feature = "profiling")]
-        let gpu_timestamp_writes = gpu_timestamp_frame.map(|frame| {
-            self.gpu_profiler
-                .as_ref()
-                .expect("timestamp frame has an owning profiler")
-                .timestamp_writes(frame)
-        });
-        #[cfg(not(feature = "profiling"))]
-        let gpu_timestamp_writes = None;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -4062,10 +5078,96 @@ impl State {
                 label: Some("RayVoxel::Frame"),
             });
         encoder.push_debug_group("RayVoxel::Frame");
-        encoder.insert_debug_marker("RayVoxel::Raytrace");
+        encoder.insert_debug_marker("RayVoxel::Primary rays");
         {
+            #[cfg(feature = "profiling")]
+            let timestamp_writes = gpu_timestamp_frame.map(|frame| {
+                self.gpu_profiler
+                    .as_ref()
+                    .expect("timestamp frame has an owning profiler")
+                    .timestamp_writes(frame, GpuProfilePass::PrimaryRays)
+            });
+            #[cfg(not(feature = "profiling"))]
+            let timestamp_writes = None;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("RayVoxel::Raytrace"),
+                label: Some("RayVoxel::Primary rays"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.ray_gbuffer.geometry_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.ray_gbuffer.surface_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: None,
+                timestamp_writes,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.push_debug_group("RayVoxel::Primary rays");
+            pass.set_pipeline(&self.primary_pipeline);
+            pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+            pass.pop_debug_group();
+        }
+        encoder.insert_debug_marker("RayVoxel::Sun shadows");
+        {
+            #[cfg(feature = "profiling")]
+            let timestamp_writes = gpu_timestamp_frame.map(|frame| {
+                self.gpu_profiler
+                    .as_ref()
+                    .expect("timestamp frame has an owning profiler")
+                    .timestamp_writes(frame, GpuProfilePass::SunShadows)
+            });
+            #[cfg(not(feature = "profiling"))]
+            let timestamp_writes = None;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("RayVoxel::Sun shadows"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.ray_gbuffer.shadow_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.push_debug_group("RayVoxel::Sun shadows");
+            pass.set_pipeline(&self.shadow_pipeline);
+            pass.set_bind_group(0, &self.shadow_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+            pass.pop_debug_group();
+        }
+        encoder.insert_debug_marker("RayVoxel::Lighting composition");
+        {
+            #[cfg(feature = "profiling")]
+            let timestamp_writes = gpu_timestamp_frame.map(|frame| {
+                self.gpu_profiler
+                    .as_ref()
+                    .expect("timestamp frame has an owning profiler")
+                    .timestamp_writes(frame, GpuProfilePass::Lighting)
+            });
+            #[cfg(not(feature = "profiling"))]
+            let timestamp_writes = None;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("RayVoxel::Lighting composition"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -4076,13 +5178,13 @@ impl State {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: gpu_timestamp_writes,
+                timestamp_writes,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.push_debug_group("RayVoxel::Raytrace");
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.push_debug_group("RayVoxel::Lighting composition");
+            pass.set_pipeline(&self.lighting_pipeline);
+            pass.set_bind_group(0, &self.full_bind_group, &[]);
             pass.draw(0..3, 0..1);
             pass.pop_debug_group();
         }
@@ -4094,7 +5196,11 @@ impl State {
                 .encode_resolve(&mut encoder, frame);
         }
         encoder.pop_debug_group();
-        self.queue.submit(Some(encoder.finish()));
+        let mut command_buffers = self
+            .ui
+            .render(&self.device, &self.queue, &mut encoder, &view);
+        command_buffers.push(encoder.finish());
+        self.queue.submit(command_buffers);
         #[cfg(feature = "profiling")]
         if let Some(frame) = gpu_timestamp_frame {
             self.gpu_profiler
@@ -4156,6 +5262,7 @@ struct App {
     window: Option<Arc<Window>>,
     state: Option<State>,
     pressed_keys: HashSet<KeyCode>,
+    mouse_captured: bool,
     last_frame: Instant,
     last_title_update: f32,
 }
@@ -4166,9 +5273,28 @@ impl App {
             window: None,
             state: None,
             pressed_keys: HashSet::new(),
+            mouse_captured: false,
             last_frame: Instant::now(),
             last_title_update: 0.0,
         }
+    }
+
+    fn set_mouse_capture(&mut self, captured: bool) {
+        let window = self
+            .window
+            .as_ref()
+            .expect("mouse capture requires the game window");
+        let mode = if captured {
+            CursorGrabMode::Locked
+        } else {
+            CursorGrabMode::None
+        };
+        window
+            .set_cursor_grab(mode)
+            .expect("the platform must support locked game cursor capture");
+        window.set_cursor_visible(!captured);
+        self.mouse_captured = captured;
+        self.pressed_keys.clear();
     }
 }
 
@@ -4192,6 +5318,7 @@ impl ApplicationHandler for App {
         self.last_frame = Instant::now();
         self.window = Some(window);
         self.state = Some(state);
+        self.set_mouse_capture(true);
     }
 
     fn window_event(
@@ -4200,6 +5327,12 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        let ui_consumed = if let (Some(window), Some(state)) = (&self.window, &mut self.state) {
+            state.ui.on_window_event(window.as_ref(), &event)
+        } else {
+            false
+        };
+        let ui_visible = self.state.as_ref().is_some_and(State::ui_visible);
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -4209,11 +5342,42 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    if code == KeyCode::F1 && event.state == ElementState::Pressed && !event.repeat
+                    {
+                        let menu_open = self.state.as_mut().is_some_and(State::toggle_ui);
+                        self.set_mouse_capture(!menu_open);
+                        return;
+                    }
+                    if code == KeyCode::Escape
+                        && event.state == ElementState::Pressed
+                        && !event.repeat
+                    {
+                        if ui_visible {
+                            if let Some(state) = &mut self.state {
+                                state.close_ui();
+                            }
+                            self.set_mouse_capture(true);
+                        } else if self.mouse_captured {
+                            self.set_mouse_capture(false);
+                        } else {
+                            event_loop.exit();
+                        }
+                        return;
+                    }
+                    if code == KeyCode::KeyL
+                        && event.state == ElementState::Pressed
+                        && !event.repeat
+                    {
+                        if let Some(state) = &mut self.state {
+                            state.toggle_ambient_only();
+                        }
+                        return;
+                    }
+                    if ui_visible || ui_consumed || !self.mouse_captured {
+                        return;
+                    }
                     match event.state {
                         ElementState::Pressed => {
-                            if code == KeyCode::Escape {
-                                event_loop.exit();
-                            }
                             self.pressed_keys.insert(code);
                         }
                         ElementState::Released => {
@@ -4222,12 +5386,28 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } if !ui_visible && !ui_consumed && !self.mouse_captured => {
+                self.set_mouse_capture(true)
+            }
+            WindowEvent::Focused(false) => {
+                if self.mouse_captured {
+                    self.set_mouse_capture(false);
+                } else {
+                    self.pressed_keys.clear();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 let _profile_span = profile_span!("Frame");
                 let now = Instant::now();
                 let delta = (now - self.last_frame).as_secs_f32().min(0.05);
                 self.last_frame = now;
-                if let (Some(state), Some(window)) = (&mut self.state, &self.window) {
+                let ui_closed = if let (Some(state), Some(window)) = (&mut self.state, &self.window)
+                {
+                    let ui_closed = state.prepare_ui(window.as_ref());
                     state.update(&self.pressed_keys, delta);
                     if state.world_time - self.last_title_update > 1.0 {
                         window.set_title(&state.status());
@@ -4235,9 +5415,33 @@ impl ApplicationHandler for App {
                     }
                     state.render();
                     profile_frame_mark!();
+                    ui_closed
+                } else {
+                    false
+                };
+                if ui_closed {
+                    self.set_mouse_capture(true);
                 }
             }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: DeviceEvent,
+    ) {
+        if !self.mouse_captured {
+            return;
+        }
+        if let DeviceEvent::MouseMotion { delta } = event
+            && let Some(state) = &mut self.state
+        {
+            state
+                .camera
+                .rotate_by_mouse(Vec2::new(delta.0 as f32, delta.1 as f32));
         }
     }
 
@@ -4259,6 +5463,49 @@ fn main() -> Result<(), winit::error::EventLoopError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raytracing_shader_is_valid_wgsl() {
+        let module = wgpu::naga::front::wgsl::parse_str(include_str!("shader.wgsl"))
+            .expect("ray-tracing shader must parse as WGSL");
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .expect("ray-tracing shader must pass WGSL validation");
+    }
+
+    #[test]
+    fn selection_ray_keeps_sixteenth_slab_bounds_exact() {
+        let minimum = Vec3::new(3.0, 9.0, 4.0);
+        let maximum = minimum + Vec3::new(1.0, 1.0 / 16.0, 1.0);
+        let (entry, exit) = ray_aabb_interval_cpu(
+            Vec3::new(3.5, 9.0 + 1.0 / 32.0, 1.0),
+            Vec3::Z,
+            minimum,
+            maximum,
+        )
+        .expect("ray through a 1/16 slab must select it");
+        assert!((entry - 3.0).abs() < 1.0e-5);
+        assert!((exit - 4.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn mouse_camera_look_rotates_and_clamps_pitch() {
+        let mut camera = Camera::new();
+        let initial_yaw = camera.yaw;
+        let initial_pitch = camera.pitch;
+        camera.rotate_by_mouse(Vec2::new(100.0, -50.0));
+        assert!(camera.yaw > initial_yaw);
+        assert!(camera.pitch > initial_pitch);
+
+        camera.rotate_by_mouse(Vec2::new(0.0, -1_000_000.0));
+        assert_eq!(camera.pitch, 1.45);
+        camera.rotate_by_mouse(Vec2::new(0.0, 1_000_000.0));
+        assert_eq!(camera.pitch, -1.45);
+    }
 
     #[cfg(feature = "profiling")]
     #[test]
@@ -4321,6 +5568,43 @@ mod tests {
         assert_eq!(world.slot_for(retained), original_slot);
         assert!(changes.detail_slots.len() >= DETAIL_DIAMETER as usize);
         assert!(changes.detail_slots.len() < DETAIL_CHUNK_COUNT);
+    }
+
+    #[test]
+    fn detailed_occupancy_matches_non_air_blocks_at_every_level() {
+        let mut world = World::new();
+        world.detailed_blocks.fill(AIR);
+        let slot = 5;
+        let local = IVec3::new(7, 20, 13);
+        let local_index = local.x as usize
+            + CHUNK_SIZE as usize * (local.z as usize + CHUNK_SIZE as usize * local.y as usize);
+        let block_index = slot * CHUNK_BLOCK_COUNT + local_index;
+        world.detailed_blocks[block_index] = block(STONE, 16);
+        world.rebuild_occupancy_slot(slot);
+
+        assert_ne!(
+            world.detail_occupancy[block_index / 32] & (1 << (block_index % 32)),
+            0
+        );
+        let brick_index = (local.x / DETAIL_BRICK_SIZE) as usize
+            + (CHUNK_SIZE / DETAIL_BRICK_SIZE) as usize
+                * ((local.z / DETAIL_BRICK_SIZE) as usize
+                    + (CHUNK_SIZE / DETAIL_BRICK_SIZE) as usize
+                        * (local.y / DETAIL_BRICK_SIZE) as usize);
+        let brick_bit =
+            (DETAIL_BRICK_OCCUPANCY_OFFSET + slot * DETAIL_BRICK_OCCUPANCY_WORDS_PER_CHUNK) * 32
+                + brick_index;
+        assert_ne!(
+            world.detail_occupancy[brick_bit / 32] & (1 << (brick_bit % 32)),
+            0
+        );
+        let coarse_bit = DETAIL_COARSE_OCCUPANCY_OFFSET * 32
+            + slot * (WORLD_HEIGHT / CHUNK_SIZE) as usize
+            + (local.y / CHUNK_SIZE) as usize;
+        assert_ne!(
+            world.detail_occupancy[coarse_bit / 32] & (1 << (coarse_bit % 32)),
+            0
+        );
     }
 
     #[test]

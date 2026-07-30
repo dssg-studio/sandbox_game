@@ -14,6 +14,9 @@ profiling = ["dep:tracy-client"]
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
 env_logger = "0.11.11"
+egui = { git = "https://github.com/emilk/egui.git", rev = "c69834e65a0681d4fa40c30545b006ce39527034" }
+egui-wgpu = { git = "https://github.com/emilk/egui.git", rev = "c69834e65a0681d4fa40c30545b006ce39527034" }
+egui-winit = { git = "https://github.com/emilk/egui.git", rev = "c69834e65a0681d4fa40c30545b006ce39527034" }
 glam = "0.33.2"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 pollster = "1.0.1"
