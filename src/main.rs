@@ -25,6 +25,53 @@ use winit::{
     window::{Window, WindowId},
 };
 
+// Tracy's convenience macros deliberately panic when no capture client has
+// been started. These wrappers keep instrumentation safe in unit tests and in
+// a profiling build launched without the viewer, while preserving allocation-
+// free static span locations during a real capture.
+#[cfg(feature = "profiling")]
+macro_rules! profile_span {
+    ($name:literal) => {
+        tracy_client::Client::running()
+            .map(|client| client.span(tracy_client::span_location!($name), 0))
+    };
+}
+
+#[cfg(not(feature = "profiling"))]
+macro_rules! profile_span {
+    ($name:literal) => {
+        ()
+    };
+}
+
+#[cfg(feature = "profiling")]
+macro_rules! profile_frame_mark {
+    () => {
+        if let Some(client) = tracy_client::Client::running() {
+            client.frame_mark();
+        }
+    };
+}
+
+#[cfg(not(feature = "profiling"))]
+macro_rules! profile_frame_mark {
+    () => {};
+}
+
+#[cfg(feature = "profiling")]
+macro_rules! profile_thread_name {
+    ($name:literal) => {
+        if let Some(client) = tracy_client::Client::running() {
+            client.set_thread_name($name);
+        }
+    };
+}
+
+#[cfg(not(feature = "profiling"))]
+macro_rules! profile_thread_name {
+    ($name:literal) => {};
+}
+
 const CHUNK_SIZE: i32 = 16;
 const WORLD_HEIGHT: i32 = 48;
 const DETAIL_RADIUS: i32 = 4;
@@ -1577,6 +1624,7 @@ impl LodQuadTree {
         lod_samples: &mut [u32],
         lod_levels: &mut [GpuLodLevel; LOD_LEVEL_COUNT],
     ) {
+        let _profile_span = profile_span!("LOD::rebuild visible quadtree cut");
         self.center = Some(center);
         self.active.clear();
         let samples_per_level = (LOD_GRID_SIZE * LOD_GRID_SIZE) as usize;
@@ -1639,6 +1687,7 @@ impl LodQuadTree {
     /// intentionally non-blocking: walking across a chunk never waits for a
     /// far terrain build.
     fn collect_completed(&mut self, lod_samples: &mut [u32]) -> bool {
+        let _profile_span = profile_span!("LOD::integrate completed sections");
         let mut changed = false;
         while let Ok(section) = self.completed.try_recv() {
             self.queued.remove(&section.key);
@@ -1657,6 +1706,7 @@ impl LodQuadTree {
     }
 
     fn pack_visible_sources(&self, lod_samples: &mut [u32]) {
+        let _profile_span = profile_span!("LOD::pack GPU columns");
         let Some(center) = self.center else {
             return;
         };
@@ -1724,6 +1774,7 @@ fn read_i32(bytes: &[u8], offset: usize) -> i32 {
 }
 
 fn load_lod_section(key: LodSectionKey) -> Option<LodSection> {
+    let _profile_span = profile_span!("LOD worker::load disk cache");
     let bytes = fs::read(lod_cache_path(key)).ok()?;
     let header_size = 20;
     if bytes.len() != header_size + LOD_SECTION_COLUMN_COUNT * std::mem::size_of::<u32>()
@@ -1743,6 +1794,7 @@ fn load_lod_section(key: LodSectionKey) -> Option<LodSection> {
 }
 
 fn save_lod_section(section: &LodSection) {
+    let _profile_span = profile_span!("LOD worker::save disk cache");
     let path = lod_cache_path(section.key);
     let Some(parent) = path.parent() else {
         return;
@@ -1770,6 +1822,7 @@ fn pack_lod_column(height: u16, top_material: u32, side_material: u32) -> u32 {
 }
 
 fn generate_lod_section(key: LodSectionKey) -> LodSection {
+    let _profile_span = profile_span!("LOD worker::generate full-data section");
     let factor = key.factor();
     let cell_size = CHUNK_SIZE * factor;
     let (minimum_x, minimum_z) = key.world_minimum();
@@ -1823,6 +1876,7 @@ fn lod_generation_worker(
     requests: mpsc::Receiver<LodGenerationRequest>,
     completed: mpsc::Sender<LodSection>,
 ) {
+    profile_thread_name!("Distant Horizons worker");
     let mut pending = BinaryHeap::new();
     loop {
         if pending.is_empty() {
@@ -1964,6 +2018,7 @@ impl World {
     /// Streams a square of full chunks and a much larger low-detail ring.
     /// Returns true only when a GPU upload of the detailed terrain is needed.
     fn stream_around(&mut self, position: Vec3) -> bool {
+        let _profile_span = profile_span!("World::stream chunks");
         let new_center = ChunkPos::from_world(position);
         if self.center == Some(new_center) {
             return false;
@@ -1998,6 +2053,7 @@ impl World {
     }
 
     fn advance(&mut self, seconds: f32) -> bool {
+        let _profile_span = profile_span!("Dynamic Trees::advance");
         self.growth_time += seconds;
         // Keep the host tick decoupled from rendering. Each tick invokes
         // Species#grow once; that method applies the species' probabilistic
@@ -2047,6 +2103,7 @@ impl World {
     }
 
     fn rebuild_detailed_buffer(&mut self) {
+        let _profile_span = profile_span!("World::pack detailed voxel buffer");
         let width = (DETAIL_DIAMETER * CHUNK_SIZE) as usize;
         let depth = width;
         self.detailed_blocks.clear();
@@ -2083,6 +2140,7 @@ impl World {
     /// volume. Wood is rendered by the separate HPD segment buffer;
     /// leaves remain full dynamic voxels with their per-species atlas tile.
     fn paint_dynamic_trees(&mut self) {
+        let _profile_span = profile_span!("Dynamic Trees::paint leaf voxels");
         let mut leaf_cells = Vec::new();
         let mut rooty_soil_cells = Vec::new();
         for chunk_z in 0..DETAIL_DIAMETER {
@@ -2150,6 +2208,7 @@ impl World {
     }
 
     fn rebuild_lod_buffer(&mut self) {
+        let _profile_span = profile_span!("LOD::schedule visible sources");
         let center = self
             .center
             .expect("LOD data is built after the stream center is set");
@@ -2158,6 +2217,7 @@ impl World {
     }
 
     fn rebuild_tree_buffer(&mut self) {
+        let _profile_span = profile_span!("Eco Machina::pack tree segments");
         self.gpu_trees.fill(GpuTree::zeroed());
         self.gpu_tree_segments.fill(GpuTreeSegment::zeroed());
         let mut tree_index = 0;
@@ -2589,6 +2649,240 @@ impl Camera {
     }
 }
 
+// `wgpu` only exposes portable timing around command-encoder/render-pass
+// boundaries.  A ray tracer implemented as one fragment pass therefore has
+// one honest in-engine GPU scope; shader-instruction analysis remains the job
+// of PIX/Nsight, where these pass labels are visible.
+#[cfg(feature = "profiling")]
+const GPU_PROFILER_TIMESTAMP_RING_SIZE: usize = 6;
+#[cfg(feature = "profiling")]
+const GPU_PROFILER_QUERIES_PER_FRAME: u32 = 2;
+#[cfg(feature = "profiling")]
+const GPU_PROFILER_HISTORY_SIZE: usize = 180;
+#[cfg(feature = "profiling")]
+const GPU_PROFILER_RESOLVE_STRIDE: u64 = wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
+
+#[cfg(feature = "profiling")]
+#[derive(Clone, Copy)]
+struct GpuTimestampFrame {
+    readback_slot: usize,
+    first_query: u32,
+}
+
+#[cfg(feature = "profiling")]
+struct GpuTimestampReadback {
+    buffer: wgpu::Buffer,
+    in_flight: bool,
+}
+
+#[cfg(feature = "profiling")]
+struct GpuTimestampCompletion {
+    readback_slot: usize,
+    succeeded: bool,
+}
+
+#[cfg(feature = "profiling")]
+#[derive(Default)]
+struct RollingTimings {
+    samples_ms: VecDeque<f64>,
+}
+
+#[cfg(feature = "profiling")]
+impl RollingTimings {
+    fn record(&mut self, milliseconds: f64) {
+        if self.samples_ms.len() == GPU_PROFILER_HISTORY_SIZE {
+            self.samples_ms.pop_front();
+        }
+        self.samples_ms.push_back(milliseconds);
+    }
+
+    fn average(&self) -> Option<f64> {
+        (!self.samples_ms.is_empty())
+            .then(|| self.samples_ms.iter().sum::<f64>() / self.samples_ms.len() as f64)
+    }
+
+    fn percentile(&self, percentile: f64) -> Option<f64> {
+        let mut samples = self.samples_ms.iter().copied().collect::<Vec<_>>();
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_by(f64::total_cmp);
+        let index = ((samples.len() - 1) as f64 * percentile.clamp(0.0, 1.0)).ceil() as usize;
+        Some(samples[index])
+    }
+}
+
+/// Timestamp-query manager for the full GPU ray-tracing pass. Query results
+/// are copied into a six-frame ring and mapped only after the GPU completes;
+/// neither profiling nor a slow capture client is allowed to block rendering.
+#[cfg(feature = "profiling")]
+struct GpuPassProfiler {
+    query_set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    readbacks: Vec<GpuTimestampReadback>,
+    completed_sender: mpsc::Sender<GpuTimestampCompletion>,
+    completed_receiver: mpsc::Receiver<GpuTimestampCompletion>,
+    timestamp_period_ns: f64,
+    next_readback_slot: usize,
+    timings: RollingTimings,
+    discarded_samples: u64,
+}
+
+#[cfg(feature = "profiling")]
+impl GpuPassProfiler {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let query_count = GPU_PROFILER_TIMESTAMP_RING_SIZE as u32 * GPU_PROFILER_QUERIES_PER_FRAME;
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("RayVoxel::GPU timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: query_count,
+        });
+        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RayVoxel::GPU timestamp resolve"),
+            size: GPU_PROFILER_TIMESTAMP_RING_SIZE as u64 * GPU_PROFILER_RESOLVE_STRIDE,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readbacks = (0..GPU_PROFILER_TIMESTAMP_RING_SIZE)
+            .map(|index| GpuTimestampReadback {
+                buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("RayVoxel::GPU timestamp readback {index}")),
+                    size: u64::from(GPU_PROFILER_QUERIES_PER_FRAME)
+                        * std::mem::size_of::<u64>() as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                in_flight: false,
+            })
+            .collect();
+        let (completed_sender, completed_receiver) = mpsc::channel();
+        Self {
+            query_set,
+            resolve_buffer,
+            readbacks,
+            completed_sender,
+            completed_receiver,
+            timestamp_period_ns: f64::from(queue.get_timestamp_period()),
+            next_readback_slot: 0,
+            timings: RollingTimings::default(),
+            discarded_samples: 0,
+        }
+    }
+
+    fn reserve_frame(&mut self) -> Option<GpuTimestampFrame> {
+        for _ in 0..self.readbacks.len() {
+            let readback_slot = self.next_readback_slot;
+            self.next_readback_slot = (self.next_readback_slot + 1) % self.readbacks.len();
+            let readback = &mut self.readbacks[readback_slot];
+            if !readback.in_flight {
+                readback.in_flight = true;
+                return Some(GpuTimestampFrame {
+                    readback_slot,
+                    first_query: readback_slot as u32 * GPU_PROFILER_QUERIES_PER_FRAME,
+                });
+            }
+        }
+        // The render thread never waits for profiling readback.  A capture
+        // overload costs one sample rather than one frame hitch.
+        self.discarded_samples += 1;
+        None
+    }
+
+    fn timestamp_writes(&self, frame: GpuTimestampFrame) -> wgpu::RenderPassTimestampWrites<'_> {
+        wgpu::RenderPassTimestampWrites {
+            query_set: &self.query_set,
+            beginning_of_pass_write_index: Some(frame.first_query),
+            end_of_pass_write_index: Some(frame.first_query + 1),
+        }
+    }
+
+    fn encode_resolve(&self, encoder: &mut wgpu::CommandEncoder, frame: GpuTimestampFrame) {
+        let byte_offset = frame.readback_slot as u64 * GPU_PROFILER_RESOLVE_STRIDE;
+        let byte_count =
+            u64::from(GPU_PROFILER_QUERIES_PER_FRAME) * std::mem::size_of::<u64>() as u64;
+        encoder.resolve_query_set(
+            &self.query_set,
+            frame.first_query..frame.first_query + GPU_PROFILER_QUERIES_PER_FRAME,
+            &self.resolve_buffer,
+            byte_offset,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffer,
+            byte_offset,
+            &self.readbacks[frame.readback_slot].buffer,
+            0,
+            byte_count,
+        );
+    }
+
+    fn map_after_submit(&mut self, frame: GpuTimestampFrame) {
+        let sender = self.completed_sender.clone();
+        self.readbacks[frame.readback_slot].buffer.map_async(
+            wgpu::MapMode::Read,
+            ..,
+            move |result| {
+                let _ = sender.send(GpuTimestampCompletion {
+                    readback_slot: frame.readback_slot,
+                    succeeded: result.is_ok(),
+                });
+            },
+        );
+    }
+
+    fn poll(&mut self, device: &wgpu::Device) {
+        // Poll, never Wait: the following channel only contains mappings the
+        // GPU has already completed.
+        let _ = device.poll(wgpu::PollType::Poll);
+        while let Ok(completion) = self.completed_receiver.try_recv() {
+            let readback = &mut self.readbacks[completion.readback_slot];
+            readback.in_flight = false;
+            if !completion.succeeded {
+                self.discarded_samples += 1;
+                continue;
+            }
+            let timestamps = match readback.buffer.get_mapped_range(..) {
+                Ok(bytes) if bytes.len() == 16 => {
+                    let begin = u64::from_le_bytes(bytes[0..8].try_into().expect("timestamp size"));
+                    let end = u64::from_le_bytes(bytes[8..16].try_into().expect("timestamp size"));
+                    drop(bytes);
+                    readback.buffer.unmap();
+                    Some((begin, end))
+                }
+                Ok(bytes) => {
+                    drop(bytes);
+                    readback.buffer.unmap();
+                    None
+                }
+                Err(_) => None,
+            };
+            let Some((begin, end)) = timestamps else {
+                self.discarded_samples += 1;
+                continue;
+            };
+            // Timestamp absolute values may wrap. A negative interval is not
+            // a useful performance sample and is deliberately discarded.
+            if end < begin {
+                self.discarded_samples += 1;
+                continue;
+            }
+            let milliseconds = (end - begin) as f64 * self.timestamp_period_ns / 1_000_000.0;
+            if !milliseconds.is_finite() || !(0.0..=1_000.0).contains(&milliseconds) {
+                self.discarded_samples += 1;
+                continue;
+            }
+            self.timings.record(milliseconds);
+            tracy_client::plot!("GPU Raytrace (ms)", milliseconds);
+        }
+    }
+
+    fn summary(&self) -> String {
+        match (self.timings.average(), self.timings.percentile(0.95)) {
+            (Some(average), Some(p95)) => format!("GPU ray {average:.2} ms · p95 {p95:.2} ms"),
+            _ => "GPU ray collecting…".to_owned(),
+        }
+    }
+}
+
 struct State {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -2606,6 +2900,8 @@ struct State {
     camera: Camera,
     world: World,
     world_time: f32,
+    #[cfg(feature = "profiling")]
+    gpu_profiler: Option<GpuPassProfiler>,
 }
 
 impl State {
@@ -2624,9 +2920,16 @@ impl State {
             })
             .await
             .map_err(|error| format!("no suitable graphics adapter: {error}"))?;
+        let profiling_timestamps_supported = cfg!(feature = "profiling")
+            && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ray voxel device"),
+                required_features: if profiling_timestamps_supported {
+                    wgpu::Features::TIMESTAMP_QUERY
+                } else {
+                    wgpu::Features::empty()
+                },
                 ..Default::default()
             })
             .await
@@ -2667,6 +2970,9 @@ impl State {
             "eco machina hpd tree segments",
             &world.gpu_tree_segments,
         );
+        #[cfg(feature = "profiling")]
+        let gpu_profiler =
+            profiling_timestamps_supported.then(|| GpuPassProfiler::new(&device, &queue));
         let (_tree_texture, tree_texture_view, tree_texture_sampler) =
             create_tree_texture(&device, &queue);
 
@@ -2787,6 +3093,8 @@ impl State {
             camera,
             world,
             world_time: 18.0,
+            #[cfg(feature = "profiling")]
+            gpu_profiler,
         })
     }
 
@@ -2801,6 +3109,7 @@ impl State {
     }
 
     fn update(&mut self, keys: &HashSet<KeyCode>, seconds: f32) {
+        let _profile_span = profile_span!("Frame::update world and uploads");
         self.camera.move_with_keys(keys, seconds);
         self.world_time += seconds;
         let terrain_changed = self.world.stream_around(self.camera.position);
@@ -2884,6 +3193,11 @@ impl State {
     }
 
     fn render(&mut self) {
+        let _profile_span = profile_span!("Renderer::encode, submit, present");
+        #[cfg(feature = "profiling")]
+        if let Some(profiler) = &mut self.gpu_profiler {
+            profiler.poll(&self.device);
+        }
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
@@ -2895,17 +3209,33 @@ impl State {
             | wgpu::CurrentSurfaceTexture::Occluded
             | wgpu::CurrentSurfaceTexture::Validation => return,
         };
+        #[cfg(feature = "profiling")]
+        let gpu_timestamp_frame = self
+            .gpu_profiler
+            .as_mut()
+            .and_then(GpuPassProfiler::reserve_frame);
+        #[cfg(feature = "profiling")]
+        let gpu_timestamp_writes = gpu_timestamp_frame.map(|frame| {
+            self.gpu_profiler
+                .as_ref()
+                .expect("timestamp frame has an owning profiler")
+                .timestamp_writes(frame)
+        });
+        #[cfg(not(feature = "profiling"))]
+        let gpu_timestamp_writes = None;
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("ray world encoder"),
+                label: Some("RayVoxel::Frame"),
             });
+        encoder.push_debug_group("RayVoxel::Frame");
+        encoder.insert_debug_marker("RayVoxel::Raytrace");
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("full-screen ray tracing pass"),
+                label: Some("RayVoxel::Raytrace"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -2916,24 +3246,54 @@ impl State {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: gpu_timestamp_writes,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            pass.push_debug_group("RayVoxel::Raytrace");
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
+            pass.pop_debug_group();
         }
+        #[cfg(feature = "profiling")]
+        if let Some(frame) = gpu_timestamp_frame {
+            self.gpu_profiler
+                .as_ref()
+                .expect("timestamp frame has an owning profiler")
+                .encode_resolve(&mut encoder, frame);
+        }
+        encoder.pop_debug_group();
         self.queue.submit(Some(encoder.finish()));
+        #[cfg(feature = "profiling")]
+        if let Some(frame) = gpu_timestamp_frame {
+            self.gpu_profiler
+                .as_mut()
+                .expect("timestamp frame has an owning profiler")
+                .map_after_submit(frame);
+        }
         self.queue.present(output);
     }
 
     fn status(&self) -> String {
-        format!(
+        let status = format!(
             "RayVoxel — {} detailed chunks · 256-chunk LOD horizon · {} Dynamic Trees (Eco Machina)",
             self.world.detailed.len(),
             self.world.active_tree_count()
-        )
+        );
+        #[cfg(feature = "profiling")]
+        {
+            let mut profiled_status = status;
+            let profiler_status = self.gpu_profiler.as_ref().map_or(
+                "GPU timestamps unavailable".to_owned(),
+                GpuPassProfiler::summary,
+            );
+            profiled_status.push_str(" · ");
+            profiled_status.push_str(&profiler_status);
+            profiled_status
+        }
+        #[cfg(not(feature = "profiling"))]
+        status
     }
 }
 
@@ -2987,6 +3347,8 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
+        profile_thread_name!("RayVoxel main");
+        let _profile_span = profile_span!("App::initialise renderer");
         let attributes = Window::default_attributes()
             .with_title("RayVoxel — starting renderer")
             .with_inner_size(PhysicalSize::new(1280, 720));
@@ -3031,6 +3393,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let _profile_span = profile_span!("Frame");
                 let now = Instant::now();
                 let delta = (now - self.last_frame).as_secs_f32().min(0.05);
                 self.last_frame = now;
@@ -3041,6 +3404,7 @@ impl ApplicationHandler for App {
                         self.last_title_update = state.world_time;
                     }
                     state.render();
+                    profile_frame_mark!();
                 }
             }
             _ => {}
@@ -3056,6 +3420,8 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<(), winit::error::EventLoopError> {
     env_logger::init();
+    #[cfg(feature = "profiling")]
+    let _tracy_client = tracy_client::Client::start();
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut App::new())
 }
@@ -3063,6 +3429,17 @@ fn main() -> Result<(), winit::error::EventLoopError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "profiling")]
+    #[test]
+    fn gpu_profiler_rolling_p95_uses_completed_samples_only() {
+        let mut timings = RollingTimings::default();
+        for sample in [1.0, 2.0, 3.0, 10.0, 4.0] {
+            timings.record(sample);
+        }
+        assert_eq!(timings.average(), Some(4.0));
+        assert_eq!(timings.percentile(0.95), Some(10.0));
+    }
 
     #[test]
     fn generated_terrain_has_valid_sixteenth_heights() {

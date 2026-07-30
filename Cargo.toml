@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
 
+[features]
+default = []
+# Opt-in development build: emits CPU timelines to a local Tracy capture and
+# enables non-blocking GPU timestamp queries. It is deliberately off in a
+# normal build so no profiling data is exposed by a shipped game.
+profiling = ["dep:tracy-client"]
+
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
 env_logger = "0.11.11"
@@ -12,5 +19,6 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 pollster = "1.0.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+tracy-client = { version = "0.18.4", default-features = false, features = ["enable", "only-localhost", "delayed-init", "system-tracing", "context-switch-tracing", "sampling", "callstack-inlines"], optional = true }
 wgpu = "30.0.0"
 winit = "0.30.13"

@@ -55,3 +55,25 @@ cargo run --release
 Управление: `WASD` — движение, стрелки — обзор, `Space`/`Shift` — вверх/вниз,
 `Left Ctrl` — ускорение, `Esc` — выход. Заголовок окна показывает число
 загруженных детальных чанков и активных Dynamic Trees.
+
+## Профилирование
+
+Обычный build не содержит профилирующего клиента и не запрашивает GPU timer
+queries. Для профилирования используется отдельная локальная сборка:
+
+```powershell
+cargo run --release --features profiling
+```
+
+- CPU timeline записывается в [Tracy](https://github.com/wolfpld/tracy): main
+  thread, stream чанков, Dynamic Trees, загрузка/генерация LOD-секций на
+  worker-потоке, GPU uploads, encode/submit/present. Клиент ограничен
+  `localhost`; Tracy viewer можно подключить до или после запуска игры.
+- GPU timestamp queries измеряют `RayVoxel::Raytrace` без ожидания GPU: шесть
+  readback-буферов возвращают результаты через несколько кадров. Среднее и p95
+  видны в заголовке окна и как plot `GPU Raytrace (ms)` в Tracy.
+- GPU capture tools получают маркеры `RayVoxel::Frame` и
+  `RayVoxel::Raytrace`. Используй PIX или Nsight Graphics для source-level
+  анализа монолитного WGSL ray pass: portable `wgpu` timestamps честно
+  измеряют GPU-проход, но не могут приписать время отдельным функциям внутри
+  одного fragment shader.
