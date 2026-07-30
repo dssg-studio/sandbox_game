@@ -15,6 +15,8 @@ struct Uniforms {
     // Exact selected block/slab bounds. selection_min.w is the active flag.
     selection_min: vec4<f32>,
     selection_max: vec4<f32>,
+    // Ambient-only, RTAO enabled, white-material debug view, unused.
+    render_options: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -49,12 +51,21 @@ struct TreeBvhNode {
 // It only lets DDA skip known-empty cells; every potentially visible block is
 // still intersected against its original slab AABB below.
 @group(0) @binding(10) var<storage, read> detail_occupancy: array<u32>;
-// These are written by the primary pass and read by the shadow/composition
-// passes. `textureLoad` keeps the G-buffer values exact: no filtering or
-// colour-space conversion takes place between the ray and lighting stages.
+// These are written by the primary/AO/shadow passes and read by later stages.
+// `textureLoad` keeps G-buffer and visibility values exact: no filtering or
+// colour-space conversion takes place between tracing and lighting.
 @group(0) @binding(11) var primary_geometry: texture_2d<f32>;
 @group(0) @binding(12) var primary_surface: texture_2d<f32>;
 @group(0) @binding(13) var shadow_mask: texture_2d<u32>;
+@group(0) @binding(14) var ambient_occlusion_mask: texture_2d<f32>;
+// Static, precomputed optical transmittance for every altitude and zenith
+// angle. It is generated once by `cs_atmosphere_transmittance` at startup.
+@group(0) @binding(15) var atmosphere_transmittance_lut: texture_2d<f32>;
+// Isotropic multiple-scattering source, precomputed after transmittance.
+// It captures higher-order atmospheric bounces without per-pixel extra rays.
+@group(0) @binding(16) var atmosphere_multiple_scattering_lut: texture_2d<f32>;
+@group(1) @binding(0) var atmosphere_transmittance_storage: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(1) var atmosphere_multiple_scattering_storage: texture_storage_2d<rgba16float, write>;
 
 const AIR: u32 = 0u;
 const GRASS: u32 = 1u;
@@ -82,6 +93,45 @@ const DETAIL_COARSE_LAYERS_PER_CHUNK: u32 = 3u;
 const MAX_DETAILED_COARSE_STEPS: u32 = 32u;
 const MAX_DETAILED_BRICK_STEPS: u32 = 16u;
 const MAX_DETAILED_FINE_STEPS: u32 = 16u;
+const AMBIENT_OCCLUSION_SAMPLE_COUNT: u32 = 6u;
+// This is deliberately a contact-scale radius, not a substitute for sun
+// shadows. A canopy several blocks above the ground must not darken it as AO.
+const AMBIENT_OCCLUSION_RADIUS: f32 = 1.5;
+const AMBIENT_OCCLUSION_RAY_BIAS: f32 = 0.025;
+const ATMOSPHERE_LUT_WIDTH: u32 = 256u;
+const ATMOSPHERE_LUT_HEIGHT: u32 = 128u;
+const ATMOSPHERE_LUT_SAMPLES: u32 = 32u;
+const ATMOSPHERE_VIEW_SAMPLES: u32 = 12u;
+const ATMOSPHERE_MULTISCATTERING_DIRECTIONS: u32 = 8u;
+const ATMOSPHERE_MULTISCATTERING_RAY_SAMPLES: u32 = 12u;
+// World coordinates are mapped onto a small planetary atmosphere. The planet
+// radius is intentionally large relative to the 48-block world height so the
+// ground remains locally flat while sunset paths still become long and red.
+const ATMOSPHERE_PLANET_RADIUS: f32 = 6360.0;
+const ATMOSPHERE_HEIGHT: f32 = 100.0;
+// The game world is measured in metres whereas the planetary model is in
+// kilometres. Without this conversion a camera at y=24 is treated as being
+// 24 km above sea level, which incorrectly puts it above most dense air.
+const ATMOSPHERE_WORLD_TO_KILOMETRES: f32 = 0.001;
+const ATMOSPHERE_RAYLEIGH_SCALE_HEIGHT: f32 = 8.0;
+const ATMOSPHERE_MIE_SCALE_HEIGHT: f32 = 1.2;
+const ATMOSPHERE_OZONE_PEAK_HEIGHT: f32 = 25.0;
+const ATMOSPHERE_OZONE_HALF_WIDTH: f32 = 15.0;
+// Earth clear-sky coefficients at 680, 550 and 440 nm, converted from m^-1
+// to km^-1. They are the conventional Earth preset used by Bruneton-style
+// real-time atmosphere models.
+const ATMOSPHERE_RAYLEIGH: vec3<f32> = vec3<f32>(0.005802, 0.013558, 0.033100);
+const ATMOSPHERE_MIE_SCATTERING: vec3<f32> = vec3<f32>(0.003996);
+const ATMOSPHERE_MIE_EXTINCTION: vec3<f32> = vec3<f32>(0.004400);
+// Chappuis-band absorption by stratospheric ozone, also in km^-1.
+const ATMOSPHERE_OZONE_ABSORPTION: vec3<f32> = vec3<f32>(0.000650, 0.001881, 0.000085);
+// Normalised clear-sky solar spectrum. Atmospheric transmission subsequently
+// shifts it warm at a low solar elevation.
+const ATMOSPHERE_SOLAR_SPECTRUM: vec3<f32> = vec3<f32>(1.000, 0.987, 0.958);
+const ATMOSPHERE_SUN_LUMINANCE: f32 = 18.0;
+const ATMOSPHERE_SUN_ANGULAR_RADIUS: f32 = 0.004675;
+const ATMOSPHERE_MIE_G: f32 = 0.8;
+const DISPLAY_EXPOSURE: f32 = 1.0;
 // A BLAS has at most 512 leaves and the forest TLAS at most 162 leaves, so
 // the maximum DFS frontier depth is below 16 entries.
 const TREE_BVH_STACK_CAPACITY: u32 = 16u;
@@ -112,6 +162,11 @@ struct LodColumn {
     top_material: u32,
     side_material: u32,
     found: bool,
+};
+
+struct AtmosphereSample {
+    radiance: vec3<f32>,
+    transmittance: vec3<f32>,
 };
 
 struct PrimaryOut {
@@ -1002,16 +1057,426 @@ fn world_any_hit(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> bool {
     return trees_any_hit(ro, rd, max_distance);
 }
 
+fn atmosphere_position(world_position: vec3<f32>) -> vec3<f32> {
+    return world_position * ATMOSPHERE_WORLD_TO_KILOMETRES +
+        vec3<f32>(0.0, ATMOSPHERE_PLANET_RADIUS, 0.0);
+}
+
+fn atmosphere_height(position: vec3<f32>) -> f32 {
+    return length(position) - ATMOSPHERE_PLANET_RADIUS;
+}
+
+fn atmosphere_density(position: vec3<f32>) -> vec3<f32> {
+    let height = atmosphere_height(position);
+    if height < 0.0 || height >= ATMOSPHERE_HEIGHT {
+        return vec3<f32>(0.0);
+    }
+    let ozone_density = max(
+        1.0 - abs(height - ATMOSPHERE_OZONE_PEAK_HEIGHT) / ATMOSPHERE_OZONE_HALF_WIDTH,
+        0.0,
+    );
+    return vec3<f32>(
+        exp(-height / ATMOSPHERE_RAYLEIGH_SCALE_HEIGHT),
+        exp(-height / ATMOSPHERE_MIE_SCALE_HEIGHT),
+        ozone_density,
+    );
+}
+
+fn atmosphere_extinction(density: vec3<f32>) -> vec3<f32> {
+    return ATMOSPHERE_RAYLEIGH * density.x +
+        ATMOSPHERE_MIE_EXTINCTION * density.y +
+        ATMOSPHERE_OZONE_ABSORPTION * density.z;
+}
+
+fn ray_sphere_exit_distance(origin: vec3<f32>, direction: vec3<f32>, radius: f32) -> f32 {
+    let half_b = dot(origin, direction);
+    let c = dot(origin, origin) - radius * radius;
+    let discriminant = half_b * half_b - c;
+    if discriminant < 0.0 {
+        return 0.0;
+    }
+    return max(-half_b + sqrt(discriminant), 0.0);
+}
+
+fn ray_sphere_entry_distance(origin: vec3<f32>, direction: vec3<f32>, radius: f32) -> f32 {
+    let half_b = dot(origin, direction);
+    let c = dot(origin, origin) - radius * radius;
+    let discriminant = half_b * half_b - c;
+    if discriminant < 0.0 {
+        return 1.0e30;
+    }
+    let near = -half_b - sqrt(discriminant);
+    let far = -half_b + sqrt(discriminant);
+    if far <= 0.0001 {
+        return 1.0e30;
+    }
+    return select(far, near, near > 0.0001);
+}
+
+fn atmosphere_transmittance(
+    origin: vec3<f32>, direction: vec3<f32>, distance: f32,
+) -> vec3<f32> {
+    if distance <= 0.0001 {
+        return vec3<f32>(1.0);
+    }
+    var rayleigh_depth = 0.0;
+    var mie_depth = 0.0;
+    var ozone_depth = 0.0;
+    var sample_index = 0u;
+    loop {
+        if sample_index >= ATMOSPHERE_LUT_SAMPLES {
+            break;
+        }
+        // A squared parameterization resolves the dense first kilometres of
+        // air even for a ~1,100 km tangent ray at the horizon.
+        let t0 = f32(sample_index) / f32(ATMOSPHERE_LUT_SAMPLES);
+        let t1 = f32(sample_index + 1u) / f32(ATMOSPHERE_LUT_SAMPLES);
+        let segment_start = t0 * t0;
+        let segment_end = t1 * t1;
+        let segment_length = (segment_end - segment_start) * distance;
+        let point = origin + direction * ((segment_start + segment_end) * 0.5 * distance);
+        let density = atmosphere_density(point);
+        rayleigh_depth += density.x * segment_length;
+        mie_depth += density.y * segment_length;
+        ozone_depth += density.z * segment_length;
+        sample_index += 1u;
+    }
+    return exp(-(
+        ATMOSPHERE_RAYLEIGH * rayleigh_depth +
+        ATMOSPHERE_MIE_EXTINCTION * mie_depth +
+        ATMOSPHERE_OZONE_ABSORPTION * ozone_depth
+    ));
+}
+
+fn sample_atmosphere_transmittance(height: f32, zenith_cosine: f32) -> vec3<f32> {
+    let dimensions = textureDimensions(atmosphere_transmittance_lut);
+    let height_fraction = clamp(height / ATMOSPHERE_HEIGHT, 0.0, 1.0);
+    let zenith_fraction = clamp(zenith_cosine * 0.5 + 0.5, 0.0, 1.0);
+    // The LUT is unfilterable RGBA16F, so sample its texel centres manually.
+    // Nearest-neighbour lookup made separate transmittance rows visible as
+    // broad bands during sunset, where attenuation changes sharply.
+    let coordinate = clamp(
+        vec2<f32>(
+            height_fraction * f32(dimensions.x) - 0.5,
+            zenith_fraction * f32(dimensions.y) - 0.5,
+        ),
+        vec2<f32>(0.0),
+        vec2<f32>(f32(dimensions.x - 1u), f32(dimensions.y - 1u)),
+    );
+    let lower = vec2<i32>(floor(coordinate));
+    let upper = min(lower + vec2<i32>(1), vec2<i32>(dimensions) - vec2<i32>(1));
+    let fraction = fract(coordinate);
+    let lower_lower = textureLoad(atmosphere_transmittance_lut, lower, 0).rgb;
+    let upper_lower = textureLoad(
+        atmosphere_transmittance_lut,
+        vec2<i32>(upper.x, lower.y),
+        0,
+    ).rgb;
+    let lower_upper = textureLoad(
+        atmosphere_transmittance_lut,
+        vec2<i32>(lower.x, upper.y),
+        0,
+    ).rgb;
+    let upper_upper = textureLoad(atmosphere_transmittance_lut, upper, 0).rgb;
+    return mix(
+        mix(lower_lower, upper_lower, fraction.x),
+        mix(lower_upper, upper_upper, fraction.x),
+        fraction.y,
+    );
+}
+
+fn sample_atmosphere_multiple_scattering(height: f32, zenith_cosine: f32) -> vec3<f32> {
+    let dimensions = textureDimensions(atmosphere_multiple_scattering_lut);
+    let height_fraction = clamp(height / ATMOSPHERE_HEIGHT, 0.0, 1.0);
+    let zenith_fraction = clamp(zenith_cosine * 0.5 + 0.5, 0.0, 1.0);
+    let coordinate = clamp(
+        vec2<f32>(
+            height_fraction * f32(dimensions.x) - 0.5,
+            zenith_fraction * f32(dimensions.y) - 0.5,
+        ),
+        vec2<f32>(0.0),
+        vec2<f32>(f32(dimensions.x - 1u), f32(dimensions.y - 1u)),
+    );
+    let lower = vec2<i32>(floor(coordinate));
+    let upper = min(lower + vec2<i32>(1), vec2<i32>(dimensions) - vec2<i32>(1));
+    let fraction = fract(coordinate);
+    let lower_lower = textureLoad(atmosphere_multiple_scattering_lut, lower, 0).rgb;
+    let upper_lower = textureLoad(
+        atmosphere_multiple_scattering_lut,
+        vec2<i32>(upper.x, lower.y),
+        0,
+    ).rgb;
+    let lower_upper = textureLoad(
+        atmosphere_multiple_scattering_lut,
+        vec2<i32>(lower.x, upper.y),
+        0,
+    ).rgb;
+    let upper_upper = textureLoad(atmosphere_multiple_scattering_lut, upper, 0).rgb;
+    return mix(
+        mix(lower_lower, upper_lower, fraction.x),
+        mix(lower_upper, upper_upper, fraction.x),
+        fraction.y,
+    );
+}
+
+fn atmosphere_phase_rayleigh(cosine: f32) -> f32 {
+    return 0.059683104 * (1.0 + cosine * cosine);
+}
+
+fn atmosphere_phase_mie(cosine: f32) -> f32 {
+    let g_squared = ATMOSPHERE_MIE_G * ATMOSPHERE_MIE_G;
+    let denominator = max(1.0 + g_squared - 2.0 * ATMOSPHERE_MIE_G * cosine, 0.0001);
+    return (1.0 - g_squared) / (12.56637061436 * pow(denominator, 1.5));
+}
+
+fn fibonacci_sphere_direction(index: u32, count: u32) -> vec3<f32> {
+    let y = 1.0 - 2.0 * (f32(index) + 0.5) / f32(count);
+    let radial = sqrt(max(1.0 - y * y, 0.0));
+    let azimuth = 2.39996323 * f32(index);
+    return vec3<f32>(cos(azimuth) * radial, y, sin(azimuth) * radial);
+}
+
+// Returns the higher-order, nearly isotropic radiance source at a point. The
+// source is precomputed by integrating first-order sky radiance over a small
+// Fibonacci sphere and summing its repeated scattering as a geometric series.
+fn atmosphere_multiple_scattering_source(
+    origin: vec3<f32>, sun_direction: vec3<f32>,
+) -> vec3<f32> {
+    var direct_irradiance = vec3<f32>(0.0);
+    var scatter_feedback = vec3<f32>(0.0);
+    var direction_index = 0u;
+    loop {
+        if direction_index >= ATMOSPHERE_MULTISCATTERING_DIRECTIONS {
+            break;
+        }
+        let direction = fibonacci_sphere_direction(
+            direction_index,
+            ATMOSPHERE_MULTISCATTERING_DIRECTIONS,
+        );
+        let atmosphere_exit = ray_sphere_exit_distance(
+            origin,
+            direction,
+            ATMOSPHERE_PLANET_RADIUS + ATMOSPHERE_HEIGHT,
+        );
+        let planet_entry = ray_sphere_entry_distance(
+            origin,
+            direction,
+            ATMOSPHERE_PLANET_RADIUS,
+        );
+        let distance = min(atmosphere_exit, planet_entry);
+        if distance > 0.0001 {
+            var rayleigh_depth = 0.0;
+            var mie_depth = 0.0;
+            var ozone_depth = 0.0;
+            var sample_index = 0u;
+            loop {
+                if sample_index >= ATMOSPHERE_MULTISCATTERING_RAY_SAMPLES {
+                    break;
+                }
+                let t0 = f32(sample_index) / f32(ATMOSPHERE_MULTISCATTERING_RAY_SAMPLES);
+                let t1 = f32(sample_index + 1u) /
+                    f32(ATMOSPHERE_MULTISCATTERING_RAY_SAMPLES);
+                let segment_start = t0 * t0;
+                let segment_end = t1 * t1;
+                let segment_length = (segment_end - segment_start) * distance;
+                let point = origin + direction *
+                    ((segment_start + segment_end) * 0.5 * distance);
+                let density = atmosphere_density(point);
+                rayleigh_depth += density.x * segment_length;
+                mie_depth += density.y * segment_length;
+                ozone_depth += density.z * segment_length;
+                let view_transmittance = exp(-(
+                    ATMOSPHERE_RAYLEIGH * rayleigh_depth +
+                    ATMOSPHERE_MIE_EXTINCTION * mie_depth +
+                    ATMOSPHERE_OZONE_ABSORPTION * ozone_depth
+                ));
+                let sun_transmittance = sample_atmosphere_transmittance(
+                    atmosphere_height(point),
+                    dot(normalize(point), sun_direction),
+                );
+                let single_scattering = sun_transmittance * ATMOSPHERE_SOLAR_SPECTRUM *
+                    (ATMOSPHERE_RAYLEIGH * density.x *
+                        atmosphere_phase_rayleigh(dot(direction, sun_direction)) +
+                    ATMOSPHERE_MIE_SCATTERING * density.y *
+                        atmosphere_phase_mie(dot(direction, sun_direction)));
+                let local_scattering = ATMOSPHERE_RAYLEIGH * density.x +
+                    ATMOSPHERE_MIE_SCATTERING * density.y;
+                direct_irradiance += view_transmittance * single_scattering * segment_length;
+                scatter_feedback += view_transmittance * local_scattering * segment_length;
+                sample_index += 1u;
+            }
+        }
+        direction_index += 1u;
+    }
+    direct_irradiance /= f32(ATMOSPHERE_MULTISCATTERING_DIRECTIONS);
+    scatter_feedback /= f32(ATMOSPHERE_MULTISCATTERING_DIRECTIONS);
+    let continuation = clamp(scatter_feedback, vec3<f32>(0.0), vec3<f32>(0.85));
+    return direct_irradiance * continuation / max(1.0 - continuation, vec3<f32>(0.05));
+}
+
+fn atmosphere_scattering(direction: vec3<f32>) -> AtmosphereSample {
+    let origin = atmosphere_position(u.camera_position.xyz);
+    let atmosphere_exit = ray_sphere_exit_distance(
+        origin,
+        direction,
+        ATMOSPHERE_PLANET_RADIUS + ATMOSPHERE_HEIGHT,
+    );
+    let planet_entry = ray_sphere_entry_distance(origin, direction, ATMOSPHERE_PLANET_RADIUS);
+    let distance = min(atmosphere_exit, planet_entry);
+    if distance <= 0.0001 {
+        return AtmosphereSample(vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    let cosine = dot(direction, u.sun_direction.xyz);
+    let rayleigh_phase = atmosphere_phase_rayleigh(cosine);
+    let mie_phase = atmosphere_phase_mie(cosine);
+    var rayleigh_depth = 0.0;
+    var mie_depth = 0.0;
+    var ozone_depth = 0.0;
+    var radiance = vec3<f32>(0.0);
+    var sample_index = 0u;
+    loop {
+        if sample_index >= ATMOSPHERE_VIEW_SAMPLES {
+            break;
+        }
+        let t0 = f32(sample_index) / f32(ATMOSPHERE_VIEW_SAMPLES);
+        let t1 = f32(sample_index + 1u) / f32(ATMOSPHERE_VIEW_SAMPLES);
+        let segment_start = t0 * t0;
+        let segment_end = t1 * t1;
+        let segment_length = (segment_end - segment_start) * distance;
+        let point = origin + direction * ((segment_start + segment_end) * 0.5 * distance);
+        let density = atmosphere_density(point);
+        rayleigh_depth += density.x * segment_length;
+        mie_depth += density.y * segment_length;
+        ozone_depth += density.z * segment_length;
+        let view_transmittance = exp(-(
+            ATMOSPHERE_RAYLEIGH * rayleigh_depth +
+            ATMOSPHERE_MIE_EXTINCTION * mie_depth +
+            ATMOSPHERE_OZONE_ABSORPTION * ozone_depth
+        ));
+        let sun_direction = u.sun_direction.xyz;
+        let sun_transmittance = sample_atmosphere_transmittance(
+            atmosphere_height(point),
+            dot(normalize(point), sun_direction),
+        );
+        let direct_scattering = ATMOSPHERE_SOLAR_SPECTRUM *
+            (ATMOSPHERE_RAYLEIGH * density.x * rayleigh_phase +
+            ATMOSPHERE_MIE_SCATTERING * density.y * mie_phase);
+        let multiple_scattering = sample_atmosphere_multiple_scattering(
+            atmosphere_height(point),
+            dot(normalize(point), sun_direction),
+        );
+        let higher_order_scattering = multiple_scattering *
+            (ATMOSPHERE_RAYLEIGH * density.x + ATMOSPHERE_MIE_SCATTERING * density.y);
+        radiance += view_transmittance *
+            (sun_transmittance * direct_scattering + higher_order_scattering) * segment_length;
+        sample_index += 1u;
+    }
+    let transmittance = exp(-(
+        ATMOSPHERE_RAYLEIGH * rayleigh_depth +
+        ATMOSPHERE_MIE_EXTINCTION * mie_depth +
+        ATMOSPHERE_OZONE_ABSORPTION * ozone_depth
+    ));
+    return AtmosphereSample(radiance * ATMOSPHERE_SUN_LUMINANCE, transmittance);
+}
+
+// Precompute a transmittance LUT over altitude (x) and local zenith cosine
+// (y). A planet hit means the sun is below the geometric horizon, so no direct
+// sunlight reaches the sample.
+@compute @workgroup_size(8, 8)
+fn cs_atmosphere_transmittance(@builtin(global_invocation_id) invocation: vec3<u32>) {
+    if invocation.x >= ATMOSPHERE_LUT_WIDTH || invocation.y >= ATMOSPHERE_LUT_HEIGHT {
+        return;
+    }
+    let height = (f32(invocation.x) + 0.5) / f32(ATMOSPHERE_LUT_WIDTH) * ATMOSPHERE_HEIGHT;
+    let zenith_cosine = (f32(invocation.y) + 0.5) / f32(ATMOSPHERE_LUT_HEIGHT) * 2.0 - 1.0;
+    let direction = vec3<f32>(
+        sqrt(max(1.0 - zenith_cosine * zenith_cosine, 0.0)),
+        zenith_cosine,
+        0.0,
+    );
+    let origin = vec3<f32>(0.0, ATMOSPHERE_PLANET_RADIUS + height, 0.0);
+    let atmosphere_exit = ray_sphere_exit_distance(
+        origin,
+        direction,
+        ATMOSPHERE_PLANET_RADIUS + ATMOSPHERE_HEIGHT,
+    );
+    let planet_entry = ray_sphere_entry_distance(origin, direction, ATMOSPHERE_PLANET_RADIUS);
+    let transmittance = select(
+        atmosphere_transmittance(origin, direction, atmosphere_exit),
+        vec3<f32>(0.0),
+        planet_entry < atmosphere_exit,
+    );
+    textureStore(
+        atmosphere_transmittance_storage,
+        vec2<i32>(invocation.xy),
+        vec4<f32>(transmittance, 1.0),
+    );
+}
+
+@compute @workgroup_size(8, 8)
+fn cs_atmosphere_multiple_scattering(@builtin(global_invocation_id) invocation: vec3<u32>) {
+    if invocation.x >= ATMOSPHERE_LUT_WIDTH || invocation.y >= ATMOSPHERE_LUT_HEIGHT {
+        return;
+    }
+    let height = (f32(invocation.x) + 0.5) / f32(ATMOSPHERE_LUT_WIDTH) * ATMOSPHERE_HEIGHT;
+    let zenith_cosine = (f32(invocation.y) + 0.5) / f32(ATMOSPHERE_LUT_HEIGHT) * 2.0 - 1.0;
+    let sun_direction = vec3<f32>(
+        sqrt(max(1.0 - zenith_cosine * zenith_cosine, 0.0)),
+        zenith_cosine,
+        0.0,
+    );
+    let origin = vec3<f32>(0.0, ATMOSPHERE_PLANET_RADIUS + height, 0.0);
+    let source = atmosphere_multiple_scattering_source(origin, sun_direction);
+    textureStore(
+        atmosphere_multiple_scattering_storage,
+        vec2<i32>(invocation.xy),
+        vec4<f32>(source, 1.0),
+    );
+}
+
 fn sky_colour(direction: vec3<f32>) -> vec3<f32> {
-    let day = smoothstep(-0.12, 0.18, u.sun_direction.y);
-    let horizon = pow(1.0 - max(direction.y, 0.0), 1.8);
-    let daytime = mix(vec3<f32>(0.17, 0.37, 0.72), vec3<f32>(0.59, 0.82, 1.0), max(direction.y, 0.0));
-    let night = mix(vec3<f32>(0.008, 0.012, 0.035), vec3<f32>(0.025, 0.045, 0.11), max(direction.y, 0.0));
-    var colour = mix(night, daytime, day);
-    colour = mix(colour, vec3<f32>(0.95, 0.42, 0.22), horizon * (1.0 - day) * 0.55);
-    let sun_disc = pow(max(dot(direction, u.sun_direction.xyz), 0.0), 1100.0);
-    colour += vec3<f32>(1.0, 0.78, 0.45) * sun_disc * max(day, 0.02) * 8.0;
-    return colour;
+    let atmosphere = atmosphere_scattering(direction);
+    let origin = atmosphere_position(u.camera_position.xyz);
+    let sun_transmittance = sample_atmosphere_transmittance(
+        atmosphere_height(origin),
+        dot(normalize(origin), u.sun_direction.xyz),
+    );
+    let sun_dot = dot(direction, u.sun_direction.xyz);
+    let sun_disc = smoothstep(
+        cos(ATMOSPHERE_SUN_ANGULAR_RADIUS + 0.0015),
+        cos(ATMOSPHERE_SUN_ANGULAR_RADIUS - 0.0005),
+        sun_dot,
+    );
+    return atmosphere.radiance +
+        sun_transmittance * ATMOSPHERE_SOLAR_SPECTRUM * sun_disc * ATMOSPHERE_SUN_LUMINANCE;
+}
+
+// The direct solar spectrum seen by a surface. A short atmospheric path keeps
+// the light almost white at noon; a long low-angle path removes blue and green
+// wavelengths, producing a dim warm sunset without a hand-authored gradient.
+fn direct_sun_illuminance(world_position: vec3<f32>) -> vec3<f32> {
+    let local_position = atmosphere_position(world_position);
+    return ATMOSPHERE_SOLAR_SPECTRUM * sample_atmosphere_transmittance(
+        atmosphere_height(local_position),
+        dot(normalize(local_position), u.sun_direction.xyz),
+    );
+}
+
+// The atmosphere is HDR. Fit it into the linear range of the sRGB swapchain
+// before the hardware performs its sRGB encoding. This keeps a blue daytime
+// sky saturated instead of clipping it into a flat grey colour.
+fn aces_tonemap(colour: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp(
+        (colour * (a * colour + vec3<f32>(b))) /
+            (colour * (c * colour + vec3<f32>(d)) + vec3<f32>(e)),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
 }
 
 fn primary_direction_from_screen(screen: vec2<f32>) -> vec3<f32> {
@@ -1103,6 +1568,17 @@ fn material_colour(
         return vec3<f32>(0.25, 0.14, 0.06) * variation;
     }
     return vec3<f32>(0.12, 0.39, 0.105) * variation;
+}
+
+// The white-material view intentionally replaces only the albedo. Geometry,
+// alpha-cutout tests, direct shadows and RTAO keep their normal behaviour.
+fn surface_albedo(
+    material: u32, point: vec3<f32>, normal: vec3<f32>, connector_uv: vec2<f32>,
+) -> vec3<f32> {
+    if u.render_options.z > 0.5 {
+        return vec3<f32>(1.0);
+    }
+    return material_colour(material, point, normal, connector_uv);
 }
 
 // Selection is actual traced geometry, not a post-process mask: each of the
@@ -1267,14 +1743,84 @@ fn fs_primary(input: VertexOut) -> PrimaryOut {
     );
 }
 
+// Six stratified Hammersley samples mapped from a unit disk to a cosine
+// hemisphere. The set is deterministic (no frame-to-frame noise), while the
+// cosine distribution gives grazing crevice rays appropriate importance.
+fn ambient_occlusion_direction(normal: vec3<f32>, sample_index: u32) -> vec3<f32> {
+    var sample = vec2<f32>(0.083333336, 0.0);
+    if sample_index == 1u {
+        sample = vec2<f32>(0.25, 0.5);
+    } else if sample_index == 2u {
+        sample = vec2<f32>(0.41666666, 0.25);
+    } else if sample_index == 3u {
+        sample = vec2<f32>(0.5833333, 0.75);
+    } else if sample_index == 4u {
+        sample = vec2<f32>(0.75, 0.125);
+    } else if sample_index == 5u {
+        sample = vec2<f32>(0.9166667, 0.625);
+    }
+    let radial = sqrt(sample.x);
+    let azimuth = sample.y * 6.28318530718;
+    let helper = select(
+        vec3<f32>(0.0, 1.0, 0.0),
+        vec3<f32>(1.0, 0.0, 0.0),
+        abs(normal.y) > 0.92,
+    );
+    let tangent = normalize(cross(helper, normal));
+    let bitangent = cross(normal, tangent);
+    return normalize(
+        tangent * (cos(azimuth) * radial) +
+        bitangent * (sin(azimuth) * radial) +
+        normal * sqrt(max(1.0 - sample.x, 0.0)),
+    );
+}
+
+@fragment
+fn fs_ambient_occlusion(input: VertexOut) -> @location(0) f32 {
+    let pixel = pixel_coordinate(input);
+    let surface = textureLoad(primary_surface, pixel, 0);
+    // Sky pixels have no surface to occlude. Ambient-only remains independent:
+    // it disables direct illumination, while this pass may still shape ambient.
+    if u.render_options.y < 0.5 || surface.w < 0.5 {
+        return 1.0;
+    }
+    let geometry = textureLoad(primary_geometry, pixel, 0);
+    let normal = geometry.yzw;
+    let direction = primary_direction(input);
+    let point = u.camera_position.xyz + direction * geometry.x;
+    var occlusion = 0.0;
+    var sample_index = 0u;
+    loop {
+        if sample_index >= AMBIENT_OCCLUSION_SAMPLE_COUNT {
+            break;
+        }
+        let sample_direction = ambient_occlusion_direction(normal, sample_index);
+        let occluder = trace_world(
+            point + normal * AMBIENT_OCCLUSION_RAY_BIAS,
+            sample_direction,
+            AMBIENT_OCCLUSION_RADIUS,
+        );
+        if occluder.found {
+            // Binary occlusion gives a leaf at the far edge of the AO sphere
+            // the same darkness as a touching block. Weight by distance so AO
+            // remains a tight contact cue rather than a fake canopy shadow.
+            let distance = clamp(occluder.t / AMBIENT_OCCLUSION_RADIUS, 0.0, 1.0);
+            let contact = 1.0 - distance;
+            occlusion += contact * contact;
+        }
+        sample_index += 1u;
+    }
+    return 1.0 - occlusion / f32(AMBIENT_OCCLUSION_SAMPLE_COUNT);
+}
+
 @fragment
 fn fs_sun_shadow(input: VertexOut) -> @location(0) u32 {
     let pixel = pixel_coordinate(input);
     let surface = textureLoad(primary_surface, pixel, 0);
     // Ambient-only deliberately avoids every sun/shadow traversal. The empty
-    // pass remains so GPU timestamp profiling keeps its stable three-stage
+    // pass remains so GPU timestamp profiling keeps its stable four-stage
     // layout, but it performs no world intersection work.
-    if u.simulation.w > 0.5 || surface.w < 0.5 || max(u.sun_direction.y, 0.0) <= 0.015 {
+    if u.render_options.x > 0.5 || surface.w < 0.5 || max(u.sun_direction.y, 0.0) <= 0.015 {
         return 0u;
     }
     let geometry = textureLoad(primary_geometry, pixel, 0);
@@ -1292,7 +1838,7 @@ fn fs_lighting(input: VertexOut) -> @location(0) vec4<f32> {
     let direction = primary_direction(input);
     let pixel = pixel_coordinate(input);
     let surface = textureLoad(primary_surface, pixel, 0);
-    let ambient_only = u.simulation.w > 0.5;
+    let ambient_only = u.render_options.x > 0.5;
     var colour = vec3<f32>(0.0);
     var scene_distance = 1.0e30;
     if surface.w < 0.5 {
@@ -1309,19 +1855,28 @@ fn fs_lighting(input: VertexOut) -> @location(0) vec4<f32> {
         let normal = geometry.yzw;
         let material = u32(surface.z);
         let point = u.camera_position.xyz + direction * scene_distance;
+        let albedo = surface_albedo(material, point, normal, surface.xy);
+        let ambient_visibility = textureLoad(ambient_occlusion_mask, pixel, 0).x;
+        // Outside the diagnostic Ambient only mode, ambient follows the sun
+        // height. It is a small moonless-night fill, not day light with the
+        // sun hidden. Ambient only intentionally stays a constant reference.
+        let daylight = smoothstep(-0.12, 0.22, u.sun_direction.y);
+        let base_ambient = select(0.006 + 0.104 * daylight, 0.11, ambient_only);
+        let ambient = base_ambient * mix(0.35, 1.0, ambient_visibility);
         if ambient_only {
-            colour = material_colour(material, point, normal, surface.xy);
+            colour = albedo * ambient;
         } else {
             let sunlight = max(u.sun_direction.y, 0.0);
             let shadow = select(1.0, 0.24, textureLoad(shadow_mask, pixel, 0).x != 0u);
             let lambert = max(dot(normal, u.sun_direction.xyz), 0.0);
-            let light = 0.16 + sunlight * (0.24 + 0.76 * lambert * shadow);
-            colour = material_colour(material, point, normal, surface.xy) * light;
+            let direct_intensity = sunlight * (0.24 + 0.76 * lambert * shadow);
+            let light = vec3<f32>(ambient) + direct_sun_illuminance(point) * direct_intensity;
+            colour = albedo * light;
             let fog = smoothstep(700.0, 4200.0, scene_distance);
             colour = mix(colour, sky_colour(direction), fog);
         }
     }
-    let display_colour = pow(max(colour, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    let display_colour = aces_tonemap(max(colour, vec3<f32>(0.0)) * DISPLAY_EXPOSURE);
     let outline_alpha = selection_outline_alpha(input);
     return vec4<f32>(mix(display_colour, vec3<f32>(0.0), outline_alpha), 1.0);
 }
