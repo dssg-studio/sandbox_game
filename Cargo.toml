@@ -1,0 +1,13 @@
+[package]
+name = "sandbox_game"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+env_logger = "0.11.11"
+glam = "0.33.2"
+pollster = "1.0.1"
+wgpu = "30.0.0"
+winit = "0.30.13"
