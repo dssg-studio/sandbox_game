@@ -19,6 +19,14 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 pollster = "1.0.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tracy-client = { version = "0.18.4", default-features = false, features = ["enable", "only-localhost", "delayed-init", "system-tracing", "context-switch-tracing", "sampling", "callstack-inlines"], optional = true }
+tracy-client = { version = "0.18.4", default-features = false, features = [
+    "enable",
+    "only-localhost",
+    "delayed-init",
+    "system-tracing",
+    "context-switch-tracing",
+    "sampling",
+    "callstack-inlines",
+], optional = true }
 wgpu = "30.0.0"
 winit = "0.30.13"

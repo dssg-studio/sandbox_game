@@ -8,6 +8,8 @@ struct Uniforms {
     camera_up: vec4<f32>,
     sun_direction: vec4<f32>,
     detail_world: vec4<f32>,
+    // Physical chunk origin for logical detailed (0, 0), ring side, unused.
+    detail_ring: vec4<f32>,
     lod_world: vec4<f32>,
     simulation: vec4<f32>,
 };
@@ -18,7 +20,7 @@ struct Uniforms {
 // material in 24..31.  These are compact full-data columns, not a bare
 // height-only horizon map.
 @group(0) @binding(2) var<storage, read> lod_columns: array<u32>;
-// Three vec4s per tree: bounds, branch range, appearance.
+// Three vec4s per tree: bounds, segment range/BLAS root, appearance.
 @group(0) @binding(3) var<storage, read> trees: array<vec4<f32>>;
 // [world origin x, world origin z, cell size, height-buffer offset] per level.
 @group(0) @binding(4) var<storage, read> lod_levels: array<vec4<f32>>;
@@ -32,6 +34,14 @@ struct TreeSegment {
 @group(0) @binding(5) var<storage, read> tree_segments: array<TreeSegment>;
 @group(0) @binding(6) var tree_texture: texture_2d<f32>;
 @group(0) @binding(7) var tree_sampler: sampler;
+struct TreeBvhNode {
+    minimum: vec4<f32>,
+    maximum: vec4<f32>,
+    // Leaf: [first primitive, count, 1, 0]. Inner: [left child, right child, 0, 0].
+    data: array<u32, 4>,
+};
+@group(0) @binding(8) var<storage, read> tree_blas_nodes: array<TreeBvhNode>;
+@group(0) @binding(9) var<storage, read> tree_tlas_nodes: array<TreeBvhNode>;
 
 const AIR: u32 = 0u;
 const GRASS: u32 = 1u;
@@ -52,6 +62,7 @@ const FOLIAGE_CONNECTOR_0: u32 = 16u;
 const FOLIAGE_CONNECTOR_5: u32 = 21u;
 const MAX_STEPS: u32 = 160u;
 const MAX_LOD_STEPS: u32 = 180u;
+const TREE_BVH_STACK_CAPACITY: u32 = 32u;
 
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
@@ -63,6 +74,12 @@ struct Hit {
     normal: vec3<f32>,
     material: u32,
     texture_uv: vec2<f32>,
+    found: bool,
+};
+
+struct RayInterval {
+    entry: f32,
+    exit: f32,
     found: bool,
 };
 
@@ -100,8 +117,19 @@ fn block_at(cell: vec3<i32>) -> u32 {
     if detail_x >= 0 && detail_x < detail_width &&
         detail_z >= 0 && detail_z < detail_depth &&
         cell.y >= 0 && cell.y < i32(u.simulation.z) {
-        let index = u32(detail_x) + u32(detail_width) *
-            (u32(detail_z) + u32(detail_depth) * u32(cell.y));
+        // Detailed storage is chunk-major and physically ring-buffered, so a
+        // stream transition writes only entering chunk ranges. Every chunk
+        // remains contiguous in the storage buffer.
+        let chunks_per_side = i32(u.detail_ring.z);
+        let logical_chunk_x = detail_x / 16;
+        let logical_chunk_z = detail_z / 16;
+        let physical_chunk_x = (logical_chunk_x + i32(u.detail_ring.x)) % chunks_per_side;
+        let physical_chunk_z = (logical_chunk_z + i32(u.detail_ring.y)) % chunks_per_side;
+        let local_x = detail_x % 16;
+        let local_z = detail_z % 16;
+        let index = u32(local_x + 16 * (local_z + 16 * (
+            cell.y + i32(u.simulation.z) * (physical_chunk_x + chunks_per_side * physical_chunk_z)
+        )));
         return detail_blocks[index];
     }
 
@@ -185,36 +213,69 @@ fn ray_box(ro: vec3<f32>, rd: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>)
     return Hit(select(exit, entry, entry > 0.0001), normal, AIR, vec2<f32>(0.0), true);
 }
 
+// This is used only to restrict exact DDA to the loaded detailed window.
+// It does not approximate block geometry: each occupied block is still
+// intersected with `ray_box` below.
+fn ray_aabb_interval(
+    ro: vec3<f32>, rd: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>
+) -> RayInterval {
+    let safe_rd = select(vec3<f32>(0.00001), rd, abs(rd) > vec3<f32>(0.00001));
+    let inverse = 1.0 / safe_rd;
+    let a = (box_min - ro) * inverse;
+    let b = (box_max - ro) * inverse;
+    let t_min = min(a, b);
+    let t_max = max(a, b);
+    let entry = max(max(t_min.x, t_min.y), t_min.z);
+    let exit = min(min(t_max.x, t_max.y), t_max.z);
+    return RayInterval(entry, exit, exit >= max(entry, 0.0));
+}
+
 fn trace_blocks(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
+    let detail_minimum = vec3<f32>(u.detail_world.x, 0.0, u.detail_world.y);
+    let detail_maximum = detail_minimum + vec3<f32>(
+        u.detail_world.z, u.simulation.z, u.detail_world.w,
+    );
+    let detail_interval = ray_aabb_interval(ro, rd, detail_minimum, detail_maximum);
+    if !detail_interval.found {
+        return empty_hit(max_distance);
+    }
+    let end_distance = min(detail_interval.exit, max_distance);
+    // Choose the side of an integer boundary that lies inside the AABB.  This
+    // prevents a negative-direction entry from testing the just-exited cell.
+    let origin_distance = max(detail_interval.entry, 0.0) + 0.0001;
+    if origin_distance >= end_distance {
+        return empty_hit(max_distance);
+    }
+    let local_ro = ro + rd * origin_distance;
     let safe_rd = select(vec3<f32>(0.00001), rd, abs(rd) > vec3<f32>(0.00001));
     let delta = abs(1.0 / safe_rd);
-    var cell = vec3<i32>(floor(ro));
+    var cell = vec3<i32>(floor(local_ro));
     let step = select(vec3<i32>(-1), vec3<i32>(1), rd >= vec3<f32>(0.0));
     var side = vec3<f32>(0.0);
     if rd.x >= 0.0 {
-        side.x = (f32(cell.x + 1) - ro.x) * delta.x;
+        side.x = (f32(cell.x + 1) - local_ro.x) * delta.x;
     } else {
-        side.x = (ro.x - f32(cell.x)) * delta.x;
+        side.x = (local_ro.x - f32(cell.x)) * delta.x;
     }
     if rd.y >= 0.0 {
-        side.y = (f32(cell.y + 1) - ro.y) * delta.y;
+        side.y = (f32(cell.y + 1) - local_ro.y) * delta.y;
     } else {
-        side.y = (ro.y - f32(cell.y)) * delta.y;
+        side.y = (local_ro.y - f32(cell.y)) * delta.y;
     }
     if rd.z >= 0.0 {
-        side.z = (f32(cell.z + 1) - ro.z) * delta.z;
+        side.z = (f32(cell.z + 1) - local_ro.z) * delta.z;
     } else {
-        side.z = (ro.z - f32(cell.z)) * delta.z;
+        side.z = (local_ro.z - f32(cell.z)) * delta.z;
     }
 
-    var entered = 0.0;
+    var entered = origin_distance;
     var step_count = 0u;
     loop {
         if step_count >= MAX_STEPS {
             break;
         }
-        let cell_exit = min(side.x, min(side.y, side.z));
-        if entered > max_distance {
+        let cell_exit = origin_distance + min(side.x, min(side.y, side.z));
+        if entered > end_distance {
             break;
         }
         let packed = block_at(cell);
@@ -222,18 +283,19 @@ fn trace_blocks(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
             let material = packed & 255u;
             let height = f32((packed >> 8u) & 255u) / 16.0;
             let candidate = ray_box(
-                ro,
+                local_ro,
                 rd,
                 vec3<f32>(f32(cell.x), f32(cell.y), f32(cell.z)),
                 vec3<f32>(f32(cell.x) + 1.0, f32(cell.y) + height, f32(cell.z) + 1.0),
             );
-            if candidate.found && candidate.t >= entered - 0.002 && candidate.t <= cell_exit + 0.002 && candidate.t < max_distance {
-                let point = ro + rd * candidate.t;
+            let hit_distance = origin_distance + candidate.t;
+            if candidate.found && hit_distance >= entered - 0.002 && hit_distance <= cell_exit + 0.002 && hit_distance < end_distance {
+                let point = ro + rd * hit_distance;
                 // Alpha-tested foliage must be transparent to both the camera
                 // ray and the sun ray. Returning no hit lets DDA advance past
                 // the leaf cell instead of creating opaque square canopies.
                 if leaf_texture_is_opaque(material, point, candidate.normal) {
-                    return Hit(candidate.t, candidate.normal, material, vec2<f32>(0.0), true);
+                    return Hit(hit_distance, candidate.normal, material, vec2<f32>(0.0), true);
                 }
             }
         }
@@ -307,23 +369,17 @@ fn trace_lod(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
     return empty_hit(max_distance);
 }
 
-fn ray_sphere(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, radius: f32) -> Hit {
-    let offset = ro - center;
-    let half_b = dot(offset, rd);
-    let discriminant = half_b * half_b - dot(offset, offset) + radius * radius;
-    if discriminant < 0.0 {
-        return empty_hit(1.0e30);
+fn ray_aabb_entry(ro: vec3<f32>, rd: vec3<f32>, minimum: vec3<f32>, maximum: vec3<f32>) -> f32 {
+    let safe_rd = select(vec3<f32>(0.00001), rd, abs(rd) > vec3<f32>(0.00001));
+    let inverse = 1.0 / safe_rd;
+    let a = (minimum - ro) * inverse;
+    let b = (maximum - ro) * inverse;
+    let entry = max(max(min(a, b).x, min(a, b).y), min(a, b).z);
+    let exit = min(min(max(a, b).x, max(a, b).y), max(a, b).z);
+    if exit < max(entry, 0.0) {
+        return 1.0e30;
     }
-    let root = sqrt(discriminant);
-    var t = -half_b - root;
-    if t < 0.0001 {
-        t = -half_b + root;
-    }
-    if t < 0.0001 {
-        return empty_hit(1.0e30);
-    }
-    let point = ro + rd * t;
-    return Hit(t, normalize(point - center), OAK_LEAVES, vec2<f32>(0.0), true);
+    return max(entry, 0.0);
 }
 
 fn bark_material(form: u32, end_grain: bool) -> u32 {
@@ -468,25 +524,27 @@ fn trace_foliage_connector(ro: vec3<f32>, rd: vec3<f32>, segment: TreeSegment) -
     return Hit(t, normal, connector_material, uv, true);
 }
 
-fn trace_trees(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
+fn trace_tree_blas(ro: vec3<f32>, rd: vec3<f32>, root: u32, max_distance: f32) -> Hit {
     var closest = empty_hit(max_distance);
-    var index = 0u;
-    let tree_count = u32(u.simulation.y);
+    var stack: array<u32, TREE_BVH_STACK_CAPACITY>;
+    var stack_size = 1u;
+    stack[0] = root;
     loop {
-        if index >= tree_count {
+        if stack_size == 0u {
             break;
         }
-        let bounds = trees[index * 3u];
-        let ranges = trees[index * 3u + 1u];
-        let broad_phase = ray_sphere(ro, rd, bounds.xyz, bounds.w);
-        let starts_inside_bounds = length(ro - bounds.xyz) < bounds.w;
-        if broad_phase.found && (broad_phase.t < closest.t || starts_inside_bounds) {
+        stack_size -= 1u;
+        let node = tree_blas_nodes[stack[stack_size]];
+        if ray_aabb_entry(ro, rd, node.minimum.xyz, node.maximum.xyz) >= closest.t {
+            continue;
+        }
+        if node.data[2u] == 1u {
             var segment = 0u;
             loop {
-                if segment >= u32(ranges.y) {
+                if segment >= node.data[1u] {
                     break;
                 }
-                let tree_segment = tree_segments[u32(ranges.x) + segment];
+                let tree_segment = tree_segments[node.data[0u] + segment];
                 var wood = trace_hpd_prism(ro, rd, tree_segment);
                 if tree_segment.style[1u] == 2u {
                     wood = trace_foliage_connector(ro, rd, tree_segment);
@@ -496,8 +554,86 @@ fn trace_trees(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
                 }
                 segment += 1u;
             }
+            continue;
         }
-        index += 1u;
+        let left = node.data[0u];
+        let right = node.data[1u];
+        let left_entry = ray_aabb_entry(
+            ro, rd, tree_blas_nodes[left].minimum.xyz, tree_blas_nodes[left].maximum.xyz,
+        );
+        let right_entry = ray_aabb_entry(
+            ro, rd, tree_blas_nodes[right].minimum.xyz, tree_blas_nodes[right].maximum.xyz,
+        );
+        if left_entry < closest.t && right_entry < closest.t {
+            if left_entry <= right_entry {
+                stack[stack_size] = right;
+                stack[stack_size + 1u] = left;
+            } else {
+                stack[stack_size] = left;
+                stack[stack_size + 1u] = right;
+            }
+            stack_size += 2u;
+        } else if left_entry < closest.t {
+            stack[stack_size] = left;
+            stack_size += 1u;
+        } else if right_entry < closest.t {
+            stack[stack_size] = right;
+            stack_size += 1u;
+        }
+    }
+    return closest;
+}
+
+fn trace_trees(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
+    let root_token = u32(u.simulation.y);
+    if root_token == 0u {
+        return empty_hit(max_distance);
+    }
+    var closest = empty_hit(max_distance);
+    var stack: array<u32, TREE_BVH_STACK_CAPACITY>;
+    var stack_size = 1u;
+    stack[0] = root_token - 1u;
+    loop {
+        if stack_size == 0u {
+            break;
+        }
+        stack_size -= 1u;
+        let node = tree_tlas_nodes[stack[stack_size]];
+        if ray_aabb_entry(ro, rd, node.minimum.xyz, node.maximum.xyz) >= closest.t {
+            continue;
+        }
+        if node.data[2u] == 1u {
+            let ranges = trees[node.data[0u] * 3u + 1u];
+            let tree_hit = trace_tree_blas(ro, rd, u32(ranges.z), closest.t);
+            if tree_hit.found && tree_hit.t < closest.t {
+                closest = tree_hit;
+            }
+            continue;
+        }
+        let left = node.data[0u];
+        let right = node.data[1u];
+        let left_entry = ray_aabb_entry(
+            ro, rd, tree_tlas_nodes[left].minimum.xyz, tree_tlas_nodes[left].maximum.xyz,
+        );
+        let right_entry = ray_aabb_entry(
+            ro, rd, tree_tlas_nodes[right].minimum.xyz, tree_tlas_nodes[right].maximum.xyz,
+        );
+        if left_entry < closest.t && right_entry < closest.t {
+            if left_entry <= right_entry {
+                stack[stack_size] = right;
+                stack[stack_size + 1u] = left;
+            } else {
+                stack[stack_size] = left;
+                stack[stack_size + 1u] = right;
+            }
+            stack_size += 2u;
+        } else if left_entry < closest.t {
+            stack[stack_size] = left;
+            stack_size += 1u;
+        } else if right_entry < closest.t {
+            stack[stack_size] = right;
+            stack_size += 1u;
+        }
     }
     return closest;
 }
