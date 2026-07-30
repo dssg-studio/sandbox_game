@@ -14,30 +14,42 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> detail_blocks: array<u32>;
-@group(0) @binding(2) var<storage, read> lod_heights: array<u32>;
+// 1/16th top height in bits 0..15, top material in 16..23 and cliff
+// material in 24..31.  These are compact full-data columns, not a bare
+// height-only horizon map.
+@group(0) @binding(2) var<storage, read> lod_columns: array<u32>;
 // Three vec4s per tree: bounds, branch range, appearance.
 @group(0) @binding(3) var<storage, read> trees: array<vec4<f32>>;
 // [world origin x, world origin z, cell size, height-buffer offset] per level.
 @group(0) @binding(4) var<storage, read> lod_levels: array<vec4<f32>>;
-// A Dynamic Trees branch is a square core plus up to six square sleeves.
-struct BranchCell {
-    // World centre xyz and discrete block radius / 16.
-    centre_radius: vec4<f32>,
-    // Direction order: down, up, north, south, west, east; two padding cells.
-    connections: array<u32, 8>,
+// Eco Machina view of a Dynamic Trees graph: one constant-width rectangular
+// spine per HPD wood block, plus separately flagged wood/foliage connectors.
+struct TreeSegment {
+    start_radius: vec4<f32>,
+    end_radius: vec4<f32>,
+    style: array<u32, 4>,
 };
-@group(0) @binding(5) var<storage, read> branches: array<BranchCell>;
+@group(0) @binding(5) var<storage, read> tree_segments: array<TreeSegment>;
+@group(0) @binding(6) var tree_texture: texture_2d<f32>;
+@group(0) @binding(7) var tree_sampler: sampler;
 
 const AIR: u32 = 0u;
 const GRASS: u32 = 1u;
 const DIRT: u32 = 2u;
 const STONE: u32 = 3u;
 const WATER: u32 = 4u;
-const WOOD: u32 = 5u;
-const LEAVES: u32 = 6u;
-const DIM_LEAVES: u32 = 7u;
-const WOOD_RINGS: u32 = 8u;
+const OAK_LEAVES: u32 = 6u;
+const SPRUCE_LEAVES: u32 = 7u;
+const ACACIA_LEAVES: u32 = 8u;
 const ROOTY_SOIL: u32 = 9u;
+const OAK_BARK: u32 = 10u;
+const SPRUCE_BARK: u32 = 11u;
+const ACACIA_BARK: u32 = 12u;
+const OAK_RINGS: u32 = 13u;
+const SPRUCE_RINGS: u32 = 14u;
+const ACACIA_RINGS: u32 = 15u;
+const FOLIAGE_CONNECTOR_0: u32 = 16u;
+const FOLIAGE_CONNECTOR_5: u32 = 21u;
 const MAX_STEPS: u32 = 160u;
 const MAX_LOD_STEPS: u32 = 180u;
 
@@ -50,6 +62,7 @@ struct Hit {
     t: f32,
     normal: vec3<f32>,
     material: u32,
+    texture_uv: vec2<f32>,
     found: bool,
 };
 
@@ -57,6 +70,8 @@ struct LodColumn {
     minimum: vec2<f32>,
     cell_size: f32,
     height: f32,
+    top_material: u32,
+    side_material: u32,
     found: bool,
 };
 
@@ -74,16 +89,7 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
 }
 
 fn empty_hit(max_distance: f32) -> Hit {
-    return Hit(max_distance, vec3<f32>(0.0), AIR, false);
-}
-
-fn opposite_direction(direction: u32) -> u32 {
-    if direction == 0u { return 1u; }
-    if direction == 1u { return 0u; }
-    if direction == 2u { return 3u; }
-    if direction == 3u { return 2u; }
-    if direction == 4u { return 5u; }
-    return 4u;
+    return Hit(max_distance, vec3<f32>(0.0), AIR, vec2<f32>(0.0), false);
 }
 
 fn block_at(cell: vec3<i32>) -> u32 {
@@ -102,12 +108,26 @@ fn block_at(cell: vec3<i32>) -> u32 {
     return AIR;
 }
 
-fn no_lod_column() -> LodColumn {
-    return LodColumn(vec2<f32>(0.0), 0.0, 0.0, false);
+fn leaf_texture_is_opaque(material: u32, point: vec3<f32>, normal: vec3<f32>) -> bool {
+    if material < OAK_LEAVES || material > ACACIA_LEAVES {
+        return true;
+    }
+    let alpha = textureSampleLevel(
+        tree_texture,
+        tree_sampler,
+        tree_texture_uv(material, point, normal, vec2<f32>(0.0)),
+        0.0,
+    ).a;
+    return alpha >= 0.5;
 }
 
-// The first clipmap that contains the point wins, therefore detail falls off
-// in successive 16m, 32m, 64m, 128m and 256m cells up to a 256-chunk radius.
+fn no_lod_column() -> LodColumn {
+    return LodColumn(vec2<f32>(0.0), 0.0, 0.0, AIR, AIR, false);
+}
+
+// The first *loaded* level that contains the point wins.  While a finer
+// full-data source is still building, its already-loaded quadtree parent stays
+// visible; there is never a synchronous generation stall or a horizon hole.
 fn lod_column_at(point: vec2<f32>) -> LodColumn {
     let grid_side = u.lod_world.x;
     var level = 0u;
@@ -122,12 +142,17 @@ fn lod_column_at(point: vec2<f32>) -> LodColumn {
             let x = u32(floor(local.x / info.z));
             let z = u32(floor(local.y / info.z));
             let index = u32(info.w) + x + u32(grid_side) * z;
-            return LodColumn(
-                info.xy + vec2<f32>(f32(x) * info.z, f32(z) * info.z),
-                info.z,
-                f32(lod_heights[index]) / 16.0,
-                true,
-            );
+            let packed = lod_columns[index];
+            if packed != 0u {
+                return LodColumn(
+                    info.xy + vec2<f32>(f32(x) * info.z, f32(z) * info.z),
+                    info.z,
+                    f32(packed & 65535u) / 16.0,
+                    (packed >> 16u) & 255u,
+                    (packed >> 24u) & 255u,
+                    true,
+                );
+            }
         }
         level += 1u;
     }
@@ -157,7 +182,7 @@ fn ray_box(ro: vec3<f32>, rd: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>)
         }
     }
     // The far intersection is needed only if a ray starts inside a cell.
-    return Hit(select(exit, entry, entry > 0.0001), normal, AIR, true);
+    return Hit(select(exit, entry, entry > 0.0001), normal, AIR, vec2<f32>(0.0), true);
 }
 
 fn trace_blocks(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
@@ -203,7 +228,13 @@ fn trace_blocks(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
                 vec3<f32>(f32(cell.x) + 1.0, f32(cell.y) + height, f32(cell.z) + 1.0),
             );
             if candidate.found && candidate.t >= entered - 0.002 && candidate.t <= cell_exit + 0.002 && candidate.t < max_distance {
-                return Hit(candidate.t, candidate.normal, material, true);
+                let point = ro + rd * candidate.t;
+                // Alpha-tested foliage must be transparent to both the camera
+                // ray and the sun ray. Returning no hit lets DDA advance past
+                // the leaf cell instead of creating opaque square canopies.
+                if leaf_texture_is_opaque(material, point, candidate.normal) {
+                    return Hit(candidate.t, candidate.normal, material, vec2<f32>(0.0), true);
+                }
             }
         }
         entered = cell_exit;
@@ -251,7 +282,12 @@ fn trace_lod(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
             ),
         );
         if candidate.found && candidate.t >= travelled - 0.01 && candidate.t < max_distance {
-            return Hit(candidate.t, candidate.normal, GRASS, true);
+            let material = select(
+                column.side_material,
+                column.top_material,
+                candidate.normal.y > 0.5,
+            );
+            return Hit(candidate.t, candidate.normal, material, vec2<f32>(0.0), true);
         }
         var exit_x = 1.0e30;
         var exit_z = 1.0e30;
@@ -287,136 +323,149 @@ fn ray_sphere(ro: vec3<f32>, rd: vec3<f32>, center: vec3<f32>, radius: f32) -> H
         return empty_hit(1.0e30);
     }
     let point = ro + rd * t;
-    return Hit(t, normalize(point - center), LEAVES, true);
+    return Hit(t, normalize(point - center), OAK_LEAVES, vec2<f32>(0.0), true);
 }
 
-// This is the shape emitted by BasicBranchBlockBakedModel: a cube from
-// 8-radius to 8+radius plus a cuboid sleeve for every connection.  It keeps
-// the original mod's thin, angular appearance and discrete 1/16 radii.
-fn trace_branch_cell(ro: vec3<f32>, rd: vec3<f32>, branch: BranchCell) -> Hit {
-    let centre = branch.centre_radius.xyz;
-    let core_radius = branch.centre_radius.w;
-    let cell_min = centre - vec3<f32>(0.5);
-    let cell_max = centre + vec3<f32>(0.5);
-
-    // ThickBranchBlockBakedModel (radii 9..24) renders a vertical trunk core
-    // and its TrunkShellBlock neighbours as one square prism. Ray tracing can
-    // intersect the resulting CSG union directly, without materialising the
-    // eight proxy shell blocks in the voxel volume.
-    if core_radius > 0.5 {
-        var thick = ray_box(
-            ro,
-            rd,
-            vec3<f32>(centre.x - core_radius, cell_min.y, centre.z - core_radius),
-            vec3<f32>(centre.x + core_radius, cell_max.y, centre.z + core_radius),
-        );
-        if !thick.found {
-            return thick;
-        }
-        thick.material = WOOD;
-        let has_side_branch = branch.connections[2u] + branch.connections[3u]
-            + branch.connections[4u] + branch.connections[5u] != 0u;
-        let face_direction = select(1u, 0u, thick.normal.y < 0.0);
-        if abs(thick.normal.y) > 0.5
-            && branch.connections[face_direction] < 1u
-            && !has_side_branch
-        {
-            // The thick renderer selects its rings texture under exactly this
-            // condition; all other exposed faces use bark.
-            thick.material = WOOD_RINGS;
-        }
-        return thick;
+fn bark_material(form: u32, end_grain: bool) -> u32 {
+    if form == 1u {
+        return select(SPRUCE_BARK, SPRUCE_RINGS, end_grain);
     }
+    if form == 2u {
+        return select(ACACIA_BARK, ACACIA_RINGS, end_grain);
+    }
+    return select(OAK_BARK, OAK_RINGS, end_grain);
+}
 
-    var closest = ray_box(
-        ro,
-        rd,
-        centre - vec3<f32>(core_radius),
-        centre + vec3<f32>(core_radius),
+// Unwrap the four side faces of an oriented rectangular branch. `v` follows
+// the actual segment axis and uses a world-stable phase, so adjacent vertical,
+// horizontal, and diagonal spines do not inherit the old world-Y banding.
+fn prism_bark_uv(
+    local_point: vec3<f32>, local_normal: vec3<f32>, half_width: f32,
+    point: vec3<f32>, unit_axis: vec3<f32>,
+) -> vec2<f32> {
+    let side_span = max(half_width * 2.0, 0.00001);
+    var around = 0.0;
+    if local_normal.x > 0.5 {
+        around = (local_point.z + half_width) / side_span * 0.25;
+    } else if local_normal.z > 0.5 {
+        around = 0.25 + (local_point.x + half_width) / side_span * 0.25;
+    } else if local_normal.x < -0.5 {
+        around = 0.50 + (half_width - local_point.z) / side_span * 0.25;
+    } else {
+        around = 0.75 + (half_width - local_point.x) / side_span * 0.25;
+    }
+    return vec2<f32>(fract(around), fract(dot(point, unit_axis) * 0.45));
+}
+
+fn prism_end_grain_uv(local_point: vec3<f32>, half_width: f32) -> vec2<f32> {
+    let side_span = max(half_width * 2.0, 0.00001);
+    return vec2<f32>(
+        (local_point.x + half_width) / side_span,
+        (local_point.z + half_width) / side_span,
     );
-    var core_was_hit = closest.found;
+}
 
-    var direction = 0u;
-    loop {
-        if direction >= 6u {
-            break;
-        }
-        let radius = f32(branch.connections[direction]) / 16.0;
-        if radius > 0.0 {
-            var sleeve_min = centre - vec3<f32>(radius);
-            var sleeve_max = centre + vec3<f32>(radius);
-            if direction == 0u { // down
-                sleeve_min.y = cell_min.y;
-                sleeve_max.y = centre.y - radius;
-            } else if direction == 1u { // up
-                sleeve_min.y = centre.y + radius;
-                sleeve_max.y = cell_max.y;
-            } else if direction == 2u { // north
-                sleeve_min.z = cell_min.z;
-                sleeve_max.z = centre.z - radius;
-            } else if direction == 3u { // south
-                sleeve_min.z = centre.z + radius;
-                sleeve_max.z = cell_max.z;
-            } else if direction == 4u { // west
-                sleeve_min.x = cell_min.x;
-                sleeve_max.x = centre.x - radius;
-            } else { // east
-                sleeve_min.x = centre.x + radius;
-                sleeve_max.x = cell_max.x;
-            }
-            let sleeve = ray_box(ro, rd, sleeve_min, sleeve_max);
-            if sleeve.found && sleeve.t < closest.t {
-                closest = sleeve;
-                core_was_hit = false;
-            }
-        }
-        direction += 1u;
+// Intersect one of the visualizer's constant-width rectangles. Its plane is
+// lifted to a square prism for ray tracing, preserving its angular 1/16-step
+// silhouette instead of smoothing it into a pipe.
+fn trace_hpd_prism(ro: vec3<f32>, rd: vec3<f32>, segment: TreeSegment) -> Hit {
+    let start = segment.start_radius.xyz;
+    let end = segment.end_radius.xyz;
+    let half_width = segment.start_radius.w;
+    let axis = end - start;
+    let segment_length = length(axis);
+    if segment_length < 0.0001 {
+        return empty_hit(1.0e30);
     }
-    if !closest.found {
-        return closest;
+    let unit_axis = axis / segment_length;
+    let reference = select(
+        vec3<f32>(0.0, 1.0, 0.0),
+        vec3<f32>(1.0, 0.0, 0.0),
+        abs(unit_axis.y) > 0.92,
+    );
+    let side = normalize(cross(unit_axis, reference));
+    let up = cross(side, unit_axis);
+    let relative_origin = ro - start;
+    let local_origin = vec3<f32>(
+        dot(relative_origin, side),
+        dot(relative_origin, unit_axis),
+        dot(relative_origin, up),
+    );
+    let local_ray = vec3<f32>(dot(rd, side), dot(rd, unit_axis), dot(rd, up));
+    let local_hit = ray_box(
+        local_origin,
+        local_ray,
+        vec3<f32>(-half_width, 0.0, -half_width),
+        vec3<f32>(half_width, segment_length, half_width),
+    );
+    if !local_hit.found {
+        return local_hit;
     }
+    let point = ro + rd * local_hit.t;
+    let local_point = local_origin + local_ray * local_hit.t;
+    let end_grain = abs(local_hit.normal.y) > 0.5;
+    let normal = normalize(
+        side * local_hit.normal.x + unit_axis * local_hit.normal.y + up * local_hit.normal.z,
+    );
+    return Hit(
+        local_hit.t,
+        normal,
+        bark_material(segment.style[0u], end_grain),
+        select(
+            prism_bark_uv(local_point, local_hit.normal, half_width, point, unit_axis),
+            prism_end_grain_uv(local_point, half_width),
+            end_grain,
+        ),
+        true,
+    );
+}
 
-    closest.material = WOOD;
-    // BasicBranchBlockBakedModel emits the rings texture only on the side
-    // opposite a sole source connection whose radius reaches this core.
-    if core_was_hit {
-        var number_of_connections = 0u;
-        var largest_connection = 0u;
-        var source_direction = 0u;
-        var side = 0u;
-        loop {
-            if side >= 6u {
-                break;
-            }
-            let connection = branch.connections[side];
-            if connection > 0u {
-                number_of_connections += 1u;
-            }
-            if connection > largest_connection {
-                largest_connection = connection;
-                source_direction = side;
-            }
-            side += 1u;
-        }
-        let core_radius_units = u32(round(core_radius * 16.0));
-        if number_of_connections == 1u && largest_connection >= core_radius_units {
-            let ring_direction = opposite_direction(source_direction);
-            let hit_direction = select(
-                select(5u, 4u, closest.normal.x < 0.0),
-                select(3u, 2u, closest.normal.z < 0.0),
-                abs(closest.normal.z) > 0.5,
-            );
-            let face_direction = select(
-                hit_direction,
-                select(1u, 0u, closest.normal.y < 0.0),
-                abs(closest.normal.y) > 0.5,
-            );
-            if face_direction == ring_direction {
-                closest.material = WOOD_RINGS;
-            }
-        }
+// `texturedRect(p1, p2, image)` from visualizer.js: a texture alpha-tested
+// square starts at spineIn, runs to its foliage centre, and is camera-facing
+// only because the original 2D canvas has one fixed viewing plane.
+fn trace_foliage_connector(ro: vec3<f32>, rd: vec3<f32>, segment: TreeSegment) -> Hit {
+    let start = segment.start_radius.xyz;
+    let end = segment.end_radius.xyz;
+    let axis = end - start;
+    let length_on_axis = length(axis);
+    if length_on_axis < 0.0001 {
+        return empty_hit(1.0e30);
     }
-    return closest;
+    let unit_axis = axis / length_on_axis;
+    let side_seed = cross(unit_axis, u.camera_forward.xyz);
+    let backup_seed = cross(unit_axis, u.camera_right.xyz);
+    let side = normalize(select(backup_seed, side_seed, length(side_seed) > 0.0001));
+    var normal = normalize(cross(unit_axis, side));
+    let denominator = dot(rd, normal);
+    if abs(denominator) < 0.00001 {
+        return empty_hit(1.0e30);
+    }
+    let t = dot(start - ro, normal) / denominator;
+    if t <= 0.0001 {
+        return empty_hit(1.0e30);
+    }
+    let point = ro + rd * t;
+    let local = point - start;
+    let along = dot(local, unit_axis);
+    let across = dot(local, side);
+    if along < 0.0 || along > length_on_axis || abs(across) > length_on_axis * 0.5 {
+        return empty_hit(1.0e30);
+    }
+    let uv = vec2<f32>(along / length_on_axis, across / length_on_axis + 0.5);
+    let connector_material = FOLIAGE_CONNECTOR_0 + (segment.style[2u] % 6u);
+    let alpha = textureSampleLevel(
+        tree_texture,
+        tree_sampler,
+        tree_texture_uv(connector_material, point, normal, uv),
+        0.0,
+    ).a;
+    if alpha < 0.25 {
+        return empty_hit(1.0e30);
+    }
+    if dot(normal, rd) > 0.0 {
+        normal = -normal;
+    }
+    return Hit(t, normal, connector_material, uv, true);
 }
 
 fn trace_trees(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
@@ -432,17 +481,20 @@ fn trace_trees(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
         let broad_phase = ray_sphere(ro, rd, bounds.xyz, bounds.w);
         let starts_inside_bounds = length(ro - bounds.xyz) < bounds.w;
         if broad_phase.found && (broad_phase.t < closest.t || starts_inside_bounds) {
-            var branch = 0u;
+            var segment = 0u;
             loop {
-                if branch >= u32(ranges.y) {
+                if segment >= u32(ranges.y) {
                     break;
                 }
-                let branch_cell = branches[u32(ranges.x) + branch];
-                let wood = trace_branch_cell(ro, rd, branch_cell);
+                let tree_segment = tree_segments[u32(ranges.x) + segment];
+                var wood = trace_hpd_prism(ro, rd, tree_segment);
+                if tree_segment.style[1u] == 2u {
+                    wood = trace_foliage_connector(ro, rd, tree_segment);
+                }
                 if wood.found && wood.t < closest.t {
                     closest = wood;
                 }
-                branch += 1u;
+                segment += 1u;
             }
         }
         index += 1u;
@@ -477,7 +529,46 @@ fn sky_colour(direction: vec3<f32>) -> vec3<f32> {
     return colour;
 }
 
-fn material_colour(material: u32, point: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+fn tree_texture_tile(material: u32) -> vec2<f32> {
+    if material >= OAK_LEAVES && material <= ACACIA_LEAVES {
+        return vec2<f32>(f32(material - OAK_LEAVES + 3u), 0.0);
+    }
+    if material >= OAK_BARK && material <= ACACIA_BARK {
+        return vec2<f32>(f32(material - OAK_BARK), 0.0);
+    }
+    if material >= OAK_RINGS && material <= ACACIA_RINGS {
+        return vec2<f32>(f32(material - OAK_RINGS), 1.0);
+    }
+    if material >= FOLIAGE_CONNECTOR_0 && material <= FOLIAGE_CONNECTOR_5 {
+        let variant = material - FOLIAGE_CONNECTOR_0;
+        return vec2<f32>(f32(3u + variant % 3u), f32(1u + variant / 3u));
+    }
+    return vec2<f32>(0.0);
+}
+
+fn tree_texture_uv(
+    material: u32, point: vec3<f32>, normal: vec3<f32>, connector_uv: vec2<f32>,
+) -> vec2<f32> {
+    let tile = tree_texture_tile(material);
+    var local = fract(point);
+    var uv = local.xz;
+    if material >= FOLIAGE_CONNECTOR_0 && material <= FOLIAGE_CONNECTOR_5 {
+        uv = connector_uv;
+    } else if material >= OAK_BARK && material <= ACACIA_RINGS {
+        // Tree prisms supply local unwrapped bark or end-grain coordinates in
+        // Hit. World voxels never use tree-wood materials.
+        uv = connector_uv;
+    } else if abs(normal.x) > 0.5 {
+        uv = local.yz;
+    } else if abs(normal.z) > 0.5 {
+        uv = local.xy;
+    }
+    return (tile + vec2<f32>(0.015, 0.015) + uv * 0.97) / vec2<f32>(6.0, 3.0);
+}
+
+fn material_colour(
+    material: u32, point: vec3<f32>, normal: vec3<f32>, connector_uv: vec2<f32>,
+) -> vec3<f32> {
     let variation = 0.92 + 0.08 * sin(point.x * 8.0 + point.z * 5.0 + point.y * 3.0);
     if material == GRASS {
         return vec3<f32>(0.24, 0.52, 0.16) * variation;
@@ -491,23 +582,17 @@ fn material_colour(material: u32, point: vec3<f32>, normal: vec3<f32>) -> vec3<f
     if material == WATER {
         return vec3<f32>(0.06, 0.27, 0.47) * variation;
     }
-    if material == WOOD {
-        let bark_lines = 0.84 + 0.16 * sin((point.x + point.z) * 39.0);
-        return vec3<f32>(0.31, 0.15, 0.055) * bark_lines * variation;
-    }
-    if material == WOOD_RINGS {
-        let local = fract(point) - vec3<f32>(0.5);
-        var ring_plane = vec2<f32>(local.x, local.z);
-        if abs(normal.x) > 0.5 {
-            ring_plane = vec2<f32>(local.y, local.z);
-        } else if abs(normal.z) > 0.5 {
-            ring_plane = vec2<f32>(local.x, local.y);
-        }
-        let rings = 0.72 + 0.28 * sin(length(ring_plane) * 92.0);
-        return vec3<f32>(0.42, 0.25, 0.105) * rings * variation;
-    }
-    if material == DIM_LEAVES {
-        return vec3<f32>(0.075, 0.22, 0.055) * variation;
+    if (material >= OAK_LEAVES && material <= ACACIA_LEAVES)
+        || (material >= OAK_BARK && material <= ACACIA_RINGS)
+        || (material >= FOLIAGE_CONNECTOR_0 && material <= FOLIAGE_CONNECTOR_5)
+    {
+        let albedo = textureSampleLevel(
+            tree_texture,
+            tree_sampler,
+            tree_texture_uv(material, point, normal, connector_uv),
+            0.0,
+        ).rgb;
+        return albedo * variation;
     }
     if material == ROOTY_SOIL {
         return vec3<f32>(0.25, 0.14, 0.06) * variation;
@@ -541,7 +626,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     }
     let lambert = max(dot(hit.normal, u.sun_direction.xyz), 0.0);
     let light = 0.16 + sunlight * (0.24 + 0.76 * lambert * shadow);
-    var colour = material_colour(hit.material, point, hit.normal) * light;
+    var colour = material_colour(hit.material, point, hit.normal, hit.texture_uv) * light;
     if hit.material == WATER {
         colour += vec3<f32>(0.12, 0.22, 0.25) * pow(max(dot(reflect(direction, hit.normal), u.sun_direction.xyz), 0.0), 30.0);
     }

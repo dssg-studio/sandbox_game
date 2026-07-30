@@ -1,0 +1,26 @@
+{
+  "tile_size": 64,
+  "oak": {
+    "bark": "oak_bark.png",
+    "end_grain": "oak_endgrain.png",
+    "leaves": "oak_leaves.png"
+  },
+  "spruce": {
+    "bark": "spruce_bark.png",
+    "end_grain": "spruce_endgrain.png",
+    "leaves": "spruce_leaves.png"
+  },
+  "acacia": {
+    "bark": "acacia_bark.png",
+    "end_grain": "acacia_endgrain.png",
+    "leaves": "acacia_leaves.png"
+  },
+  "connectors": [
+    "connector-1.png",
+    "connector-2.png",
+    "connector-3.png",
+    "connector-4.png",
+    "connector-5.png",
+    "connector-6.png"
+  ]
+}

@@ -1,15 +1,20 @@
 //! A small ray-traced voxel sandbox.  Geometry is evaluated in the WGSL fragment
-//! shader: voxel cells use DDA ray traversal. Dynamic Trees data is currently
-//! displayed through its native branch/leaf cells.
+//! shader: voxel cells use DDA ray traversal. Dynamic Trees keeps its native
+//! growth cells but is rendered through the Eco Machina HPD layout.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, mpsc},
+    thread,
     time::Instant,
 };
 
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Vec3};
+use serde::Deserialize;
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
@@ -30,9 +35,24 @@ const LOD_GRID_SIZE: i32 = 33;
 const LOD_LEVEL_FACTORS: [i32; 5] = [1, 2, 4, 8, 16];
 const LOD_LEVEL_COUNT: usize = LOD_LEVEL_FACTORS.len();
 const LOD_SAMPLE_COUNT: usize = LOD_LEVEL_COUNT * (LOD_GRID_SIZE * LOD_GRID_SIZE) as usize;
+/// Dynamic data sources are deliberately smaller than a render grid.  This is
+/// the same division of responsibilities as DH's full-data sources: a source
+/// owns a compact square of columns and can be generated, cached and merged
+/// independently of the visible LOD cut.
+const LOD_SECTION_SIDE: i32 = 16;
+const LOD_SECTION_COLUMN_COUNT: usize = (LOD_SECTION_SIDE * LOD_SECTION_SIDE) as usize;
+const LOD_CACHE_MAGIC: [u8; 4] = *b"RVLH";
+const LOD_CACHE_VERSION: u32 = 1;
+/// Runtime cache is deliberately relative to the game directory, so a
+/// portable copy of the game keeps its distant-world data beside its assets.
+const LOD_CACHE_FOLDER: &str = "cache/distant_horizons";
 const MAX_TREES: usize = 192;
-const MAX_BRANCHES_PER_TREE: usize = 128;
-const MAX_GPU_BRANCHES: usize = MAX_TREES * MAX_BRANCHES_PER_TREE;
+/// The Eco Machina layout emits one rectangular spine per wood block plus
+/// optional sub-chain and foliage connectors. The limit is deliberately above
+/// every bundled JoCode's branch/leaf density, and enforces one renderer-only
+/// representation.
+const MAX_RENDER_SEGMENTS_PER_TREE: usize = 2048;
+const MAX_GPU_TREE_SEGMENTS: usize = MAX_TREES * MAX_RENDER_SEGMENTS_PER_TREE;
 /// Host cadence for one call to Dynamic Trees' Species#grow. The source
 /// routine itself applies each species' growth rate as a probability.
 const TREE_GROWTH_TICK_SECONDS: f32 = 1.0;
@@ -54,8 +74,16 @@ const GRASS: u32 = 1;
 const DIRT: u32 = 2;
 const STONE: u32 = 3;
 const WATER: u32 = 4;
-const TREE_LEAVES: u32 = 6;
+const OAK_LEAVES: u32 = 6;
+const SPRUCE_LEAVES: u32 = 7;
+const ACACIA_LEAVES: u32 = 8;
 const ROOTY_SOIL: u32 = 9;
+/// Authored tree materials use a single native 64×64 pixel-art tile. Keeping
+/// this size exact avoids a resample between the source PNG and GPU atlas.
+const TREE_TEXTURE_TILE_SIZE: u32 = 64;
+const TREE_TEXTURE_COLUMNS: u32 = 6;
+const TREE_TEXTURE_ROWS: u32 = 3;
+const TREE_TEXTURE_CONFIG_PATH: &str = "assets/tree/tree_textures.json";
 
 /// A block packs its material in the low byte and height in 1/16th-block units
 /// in the next byte.  A height of 16 is a regular block; all values 1..=15 are
@@ -98,6 +126,22 @@ impl TreeForm {
             _ => Self::Deciduous,
         }
     }
+
+    fn render_id(self) -> u32 {
+        match self {
+            Self::Deciduous => 0,
+            Self::Conifer => 1,
+            Self::Acacia => 2,
+        }
+    }
+
+    fn leaf_material(self) -> u32 {
+        match self {
+            Self::Deciduous => OAK_LEAVES,
+            Self::Conifer => SPRUCE_LEAVES,
+            Self::Acacia => ACACIA_LEAVES,
+        }
+    }
 }
 
 struct Chunk {
@@ -111,26 +155,27 @@ struct Chunk {
 struct GpuTree {
     // Sphere used for a cheap per-tree broad phase.
     bounds: [f32; 4],
-    // Branch offset/count, leaf offset/count.
+    // Eco Machina HPD segment offset/count, unused, unused.
     layout: [f32; 4],
-    // Stable tint seed, soil fertility, age in pulses, unused.
+    // Tree form, soil fertility, age in pulses, unused.
     appearance: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuBranch {
-    // Dynamic Trees' central cube: world-space centre and radius in blocks.
-    centre_radius: [f32; 4],
-    // Side radii in Direction order: down/up/north/south/west/east. Two
-    // padding values preserve the 16-byte storage-array stride required by
-    // WGSL. A sleeve uses each radius to extend the core to that block face.
-    connections: [u32; 8],
+struct GpuTreeSegment {
+    // End-point world positions and half-width in blocks. The two widths are
+    // intentionally equal: each Dynamic Trees wood cell owns one uniform,
+    // rectangular Eco Machina strip at its direct 1/16-based DT radius.
+    start_radius: [f32; 4],
+    end_radius: [f32; 4],
+    // [species form, kind, foliage texture variant, unused].
+    style: [u32; 4],
 }
 
 // Dynamic Trees stores a tree as a sparse collection of branch and leaf
-// blocks. The renderer consumes the same radius and neighbour data as the
-// original baked branch model, but ray-intersects those cuboids directly.
+// blocks. The renderer reads that topology only to build an HPD hierarchy and
+// traces constant-width Eco Machina rectangular segments directly.
 const DIRECTIONS: [IVec3; 6] = [
     IVec3::NEG_Y,
     IVec3::Y,
@@ -141,6 +186,27 @@ const DIRECTIONS: [IVec3; 6] = [
 ];
 const DOWN: usize = 0;
 const UP: usize = 1;
+
+const SEGMENT_WOOD_SPINE: u32 = 0;
+const SEGMENT_WOOD_CONNECTOR: u32 = 1;
+const SEGMENT_FOLIAGE_CONNECTOR: u32 = 2;
+
+/// Direct 3D counterpart of the visualizer's per-wood-block HPD metadata.
+/// Dynamic Trees remains the living source graph; this structure only turns
+/// it into Eco Machina spine meshes and connectors.
+struct HpdNode {
+    position: IVec3,
+    parent: Option<usize>,
+    children: Vec<usize>,
+    subtree_weight: u32,
+    // The Dynamic Trees branch value is the authoritative render half-width:
+    // radius 1..=8 maps directly to 1/16..=8/16 of a block.
+    dt_radius: u8,
+    chain_id: u16,
+    position_in_chain: u16,
+    chain_depth: u16,
+    heavy_child: Option<usize>,
+}
 
 fn opposite(direction: usize) -> usize {
     [UP, DOWN, 3, 2, 5, 4][direction]
@@ -266,11 +332,10 @@ impl Tree {
         // Dynamic Trees worldgen selects a JoCode for a requested radius, then
         // emits its branch instructions, inflates the network and ages the
         // leaf volume. It does not replay ordinary random growth.
-        if !tree.generate_jocode_worldgen(seed) {
-            // Kept only as a defensive fallback for a malformed local data
-            // registry; the bundled species all have JoCode entries.
-            tree.grow_pulse();
-        }
+        assert!(
+            tree.generate_jocode_worldgen(seed),
+            "the bundled Dynamic Trees JoCode registry must generate a rooted tree"
+        );
         tree
     }
 
@@ -633,6 +698,7 @@ impl Tree {
         changed
     }
 
+    #[cfg(test)]
     fn grow_pulse(&mut self) -> bool {
         self.grow_pulse_in(&GrowthEnvironment::default())
     }
@@ -1061,26 +1127,284 @@ impl Tree {
             .unwrap_or(0)
     }
 
-    /// Equivalent to `BranchBlock#getConnectionData`: the core reads the
-    /// radius from each neighbouring branch, clamps it to its own radius and
-    /// connects twigs to dynamic leaves. Rooty soil has a connection radius of
-    /// eight, which becomes the root branch's own radius after clamping.
-    fn connection_radii(&self, position: IVec3, core_radius: u8) -> [u32; 8] {
-        let mut connections = [0_u32; 8];
-        for (direction, offset) in DIRECTIONS.iter().enumerate() {
-            let neighbour = position + *offset;
-            let radius = if let Some(radius) = self.branches.get(&neighbour) {
-                *radius
-            } else if neighbour == self.root {
-                8 // SoilBlock#getRadiusForConnection
-            } else if core_radius == 1 && self.leaves.contains_key(&neighbour) {
-                1 // LeavesProperties#getRadiusForConnection for a twig
-            } else {
-                0
-            };
-            connections[direction] = u32::from(radius.min(core_radius));
+    /// Builds the same breadth-first parent map used by the public Eco
+    /// Machina visualizer. The Dynamic Trees graph remains authoritative for
+    /// growth; only its connected wood cells enter this render hierarchy.
+    fn build_hpd_nodes(&self) -> Vec<HpdNode> {
+        let trunk = self.root + IVec3::Y;
+        if !self.branches.contains_key(&trunk) {
+            return Vec::new();
         }
-        connections
+
+        let mut nodes = vec![HpdNode {
+            position: trunk,
+            parent: None,
+            children: Vec::new(),
+            subtree_weight: 0,
+            dt_radius: *self
+                .branches
+                .get(&trunk)
+                .expect("a rooted HPD node was checked above"),
+            chain_id: 0,
+            position_in_chain: 0,
+            chain_depth: 0,
+            heavy_child: None,
+        }];
+        let mut lookup = HashMap::with_capacity(self.branches.len());
+        lookup.insert(trunk, 0_usize);
+        let mut queue = VecDeque::from([0_usize]);
+        while let Some(parent) = queue.pop_front() {
+            let parent_position = nodes[parent].position;
+            for offset in DIRECTIONS {
+                let child_position = parent_position + offset;
+                if !self.branches.contains_key(&child_position)
+                    || lookup.contains_key(&child_position)
+                {
+                    continue;
+                }
+                let child = nodes.len();
+                nodes.push(HpdNode {
+                    position: child_position,
+                    parent: Some(parent),
+                    children: Vec::new(),
+                    subtree_weight: 0,
+                    dt_radius: *self
+                        .branches
+                        .get(&child_position)
+                        .expect("HPD children are Dynamic Trees branch cells"),
+                    chain_id: 0,
+                    position_in_chain: 0,
+                    chain_depth: 0,
+                    heavy_child: None,
+                });
+                lookup.insert(child_position, child);
+                nodes[parent].children.push(child);
+                queue.push_back(child);
+            }
+        }
+        nodes
+    }
+
+    /// `computeSubtreeWeights` and `pickPrimaryChild` from visualizer.js.
+    /// Every wood block contributes exactly one topology weight; its Dynamic
+    /// Trees radius independently remains the rendering width.
+    fn compute_subtree_weights(nodes: &mut [HpdNode], index: usize) -> u32 {
+        let children = nodes[index].children.clone();
+        let mut weight = 1_u32;
+        let mut heavy_child = None;
+        let mut best_weight = 0_u32;
+        for child in children {
+            let child_weight = Self::compute_subtree_weights(nodes, child);
+            weight = weight.saturating_add(child_weight);
+            // Strict comparison retains the source's first-neighbour tie
+            // behaviour and its stable, angular branch choice.
+            if child_weight > best_weight {
+                best_weight = child_weight;
+                heavy_child = Some(child);
+            }
+        }
+        nodes[index].subtree_weight = weight;
+        nodes[index].heavy_child = heavy_child;
+        weight
+    }
+
+    /// `assignChainsWithMeta` from visualizer.js. A primary child continues
+    /// its parent's chain; every other child begins a sub-chain one depth down.
+    fn assign_hpd_chains(
+        nodes: &mut [HpdNode],
+        index: usize,
+        chain_id: u16,
+        position_in_chain: u16,
+        chain_depth: u16,
+        next_chain_id: &mut u16,
+    ) {
+        nodes[index].chain_id = chain_id;
+        nodes[index].position_in_chain = position_in_chain;
+        nodes[index].chain_depth = chain_depth;
+        let heavy_child = nodes[index].heavy_child;
+        let children = nodes[index].children.clone();
+        for child in children {
+            if Some(child) == heavy_child {
+                Self::assign_hpd_chains(
+                    nodes,
+                    child,
+                    chain_id,
+                    position_in_chain.saturating_add(1),
+                    chain_depth,
+                    next_chain_id,
+                );
+            } else {
+                let child_chain = *next_chain_id;
+                *next_chain_id = next_chain_id.saturating_add(1);
+                Self::assign_hpd_chains(
+                    nodes,
+                    child,
+                    child_chain,
+                    0,
+                    chain_depth.saturating_add(1),
+                    next_chain_id,
+                );
+            }
+        }
+    }
+
+    fn node_spine(nodes: &[HpdNode], index: usize) -> (Vec3, Vec3) {
+        let node = &nodes[index];
+        let centre = node.position.as_vec3() + Vec3::splat(0.5);
+        let spine_in = node.parent.map_or(centre - Vec3::Y * 0.5, |parent| {
+            (centre + nodes[parent].position.as_vec3() + Vec3::splat(0.5)) * 0.5
+        });
+        let spine_out = node
+            .heavy_child
+            .map_or(centre + (centre - spine_in), |child| {
+                (centre + nodes[child].position.as_vec3() + Vec3::splat(0.5)) * 0.5
+            });
+        (spine_in, spine_out)
+    }
+
+    fn push_hpd_segment(
+        segments: &mut Vec<GpuTreeSegment>,
+        start: Vec3,
+        end: Vec3,
+        half_width: f32,
+        form: u32,
+        kind: u32,
+        variant: u32,
+    ) {
+        segments.push(GpuTreeSegment {
+            start_radius: [start.x, start.y, start.z, half_width],
+            end_radius: [end.x, end.y, end.z, half_width],
+            style: [form, kind, variant, 0],
+        });
+    }
+
+    /// Direct 3D lift of Eco Machina's public visualizer. Its 2D face and
+    /// diagonal leaf search becomes all 26 immediate 3D neighbours here;
+    /// Dynamic Trees itself still uses only its six face-connected wood graph.
+    fn foliage_neighbour_offsets() -> Vec<IVec3> {
+        let mut offsets = DIRECTIONS.to_vec();
+        for y in -1..=1 {
+            for z in -1..=1 {
+                for x in -1..=1 {
+                    let offset = IVec3::new(x, y, z);
+                    let distance = x.abs() + y.abs() + z.abs();
+                    if distance > 1 {
+                        offsets.push(offset);
+                    }
+                }
+            }
+        }
+        offsets
+    }
+
+    /// Produces the visualizer's single rectangular wood strip per block,
+    /// sub-chain connectors from a parent's `spineIn`, and leaf-owned textured
+    /// square connectors. Strip widths come directly from the Dynamic Trees
+    /// branch radius; no branch-cell/sleeve renderer is retained.
+    fn eco_machina_segments(&self) -> Vec<GpuTreeSegment> {
+        let mut nodes = self.build_hpd_nodes();
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+        Self::compute_subtree_weights(&mut nodes, 0);
+        let mut chain_count = 1_u16;
+        Self::assign_hpd_chains(&mut nodes, 0, 0, 0, 0, &mut chain_count);
+        debug_assert!(nodes.iter().all(|node| node.chain_id < chain_count));
+
+        let mut node_lookup = HashMap::with_capacity(nodes.len());
+        for (index, node) in nodes.iter().enumerate() {
+            node_lookup.insert(node.position, index);
+        }
+        let spines: Vec<(Vec3, Vec3)> = (0..nodes.len())
+            .map(|index| Self::node_spine(&nodes, index))
+            .collect();
+        let form = self.form.render_id();
+        let mut segments = Vec::with_capacity(nodes.len() * 3 + self.leaves.len());
+
+        for (index, node) in nodes.iter().enumerate() {
+            let (spine_in, spine_out) = spines[index];
+            Self::push_hpd_segment(
+                &mut segments,
+                spine_in,
+                spine_out,
+                f32::from(node.dt_radius) / 16.0,
+                form,
+                SEGMENT_WOOD_SPINE,
+                0,
+            );
+            for &child in &node.children {
+                if Some(child) == node.heavy_child {
+                    continue;
+                }
+                let child_centre = nodes[child].position.as_vec3() + Vec3::splat(0.5);
+                let connector_end =
+                    (node.position.as_vec3() + Vec3::splat(0.5) + child_centre) * 0.5;
+                // Keep the connector entirely inside both direct DT branch
+                // radii. This is the square-prism counterpart of joining two
+                // Dynamic Trees branch cells, not a synthetic HPD taper.
+                let connector_half_width =
+                    f32::from(node.dt_radius.min(nodes[child].dt_radius)) / 16.0;
+                Self::push_hpd_segment(
+                    &mut segments,
+                    spine_in,
+                    connector_end,
+                    connector_half_width,
+                    form,
+                    SEGMENT_WOOD_CONNECTOR,
+                    0,
+                );
+            }
+        }
+
+        let offsets = Self::foliage_neighbour_offsets();
+        let mut leaves: Vec<IVec3> = self.leaves.keys().copied().collect();
+        leaves.sort_by_key(|position| (position.x, position.y, position.z));
+        for leaf in leaves {
+            let leaf_centre = leaf.as_vec3() + Vec3::splat(0.5);
+            let mut face_candidates = Vec::new();
+            let mut diagonal_candidates = Vec::new();
+            for offset in &offsets {
+                let Some(&index) = node_lookup.get(&(leaf + *offset)) else {
+                    continue;
+                };
+                let wood_centre = nodes[index].position.as_vec3() + Vec3::splat(0.5);
+                let foliage_anchor = (wood_centre + leaf_centre) * 0.5;
+                if spines[index].1.distance(foliage_anchor) < 0.5 {
+                    continue;
+                }
+                if offset.abs().element_sum() == 1 {
+                    face_candidates.push(index);
+                } else {
+                    diagonal_candidates.push(index);
+                }
+            }
+            let candidates = if face_candidates.is_empty() {
+                diagonal_candidates
+            } else {
+                face_candidates
+            };
+            let Some(index) = candidates
+                .iter()
+                .copied()
+                .find(|index| nodes[*index].heavy_child.is_none())
+                .or_else(|| candidates.first().copied())
+            else {
+                continue;
+            };
+            // The public code uses (row * 31 + column * 17) % 6. This is the
+            // same deterministic six-way selection with the third 3D axis.
+            let texture_variant = (leaf.x * 31 + leaf.y * 17 + leaf.z * 13).rem_euclid(6) as u32;
+            Self::push_hpd_segment(
+                &mut segments,
+                spines[index].0,
+                leaf_centre,
+                f32::from(nodes[index].dt_radius) / 16.0,
+                form,
+                SEGMENT_FOLIAGE_CONNECTOR,
+                texture_variant,
+            );
+        }
+        segments
     }
 }
 
@@ -1149,6 +1473,379 @@ struct GpuLodLevel {
     data: [f32; 4],
 }
 
+/// Address of a 16×16 full-data source.  `detail` identifies the quadtree
+/// depth: each parent is exactly a 2×2 merge of sources at the preceding
+/// detail level.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct LodSectionKey {
+    detail: u8,
+    x: i32,
+    z: i32,
+}
+
+impl LodSectionKey {
+    fn parent(self) -> Option<Self> {
+        let detail = self.detail.checked_add(1)?;
+        (usize::from(detail) < LOD_LEVEL_COUNT).then_some(Self {
+            detail,
+            x: self.x.div_euclid(2),
+            z: self.z.div_euclid(2),
+        })
+    }
+
+    fn factor(self) -> i32 {
+        LOD_LEVEL_FACTORS[self.detail as usize]
+    }
+
+    fn world_minimum(self) -> (i32, i32) {
+        let side = LOD_SECTION_SIDE * CHUNK_SIZE * self.factor();
+        (self.x * side, self.z * side)
+    }
+}
+
+/// One Distant-Horizons-like full-data source.  A packed value keeps the
+/// top height in 1/16ths plus separate top and cliff materials, so a distant
+/// hill does not degenerate into a uniformly green cuboid.
+#[derive(Clone)]
+struct LodSection {
+    key: LodSectionKey,
+    columns: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LodGenerationRequest {
+    key: LodSectionKey,
+    priority: i32,
+}
+
+impl Ord for LodGenerationRequest {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max heap; invert distance so sections nearest the
+        // player are generated first.  The coordinates make ties deterministic.
+        other
+            .priority
+            .cmp(&self.priority)
+            .then_with(|| other.key.detail.cmp(&self.key.detail))
+            .then_with(|| other.key.z.cmp(&self.key.z))
+            .then_with(|| other.key.x.cmp(&self.key.x))
+    }
+}
+
+impl PartialOrd for LodGenerationRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Sparse quadtree cut plus the background full-data provider.  The renderer
+/// consumes its current cut as compact clipmap metadata, while source data
+/// itself remains independent, asynchronously built and persisted on disk.
+struct LodQuadTree {
+    center: Option<ChunkPos>,
+    active: HashSet<LodSectionKey>,
+    cached: HashMap<LodSectionKey, LodSection>,
+    queued: HashSet<LodSectionKey>,
+    requests: mpsc::Sender<LodGenerationRequest>,
+    completed: mpsc::Receiver<LodSection>,
+}
+
+impl LodQuadTree {
+    fn new() -> Self {
+        let (request_sender, request_receiver) = mpsc::channel();
+        let (completed_sender, completed_receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("distant-horizons-data".into())
+            .spawn(move || lod_generation_worker(request_receiver, completed_sender))
+            .expect("could not start Distant Horizons data worker");
+        Self {
+            center: None,
+            active: HashSet::new(),
+            cached: HashMap::new(),
+            queued: HashSet::new(),
+            requests: request_sender,
+            completed: completed_receiver,
+        }
+    }
+
+    /// Rebuilds the visible *cut* of the sparse quadtree.  Each requested
+    /// source is 16×16 cells; the five nested levels form non-overlapping
+    /// distance rings in the ray tracer, with an unloaded child naturally
+    /// resolved by its available parent level.
+    fn center_on(
+        &mut self,
+        center: ChunkPos,
+        lod_samples: &mut [u32],
+        lod_levels: &mut [GpuLodLevel; LOD_LEVEL_COUNT],
+    ) {
+        self.center = Some(center);
+        self.active.clear();
+        let samples_per_level = (LOD_GRID_SIZE * LOD_GRID_SIZE) as usize;
+
+        for (detail, factor) in LOD_LEVEL_FACTORS.iter().copied().enumerate() {
+            let half_width = LOD_GRID_SIZE / 2;
+            let origin_chunk = ChunkPos {
+                x: center.x - half_width * factor,
+                z: center.z - half_width * factor,
+            };
+            let sample_offset = detail * samples_per_level;
+            lod_levels[detail] = GpuLodLevel {
+                data: [
+                    (origin_chunk.x * CHUNK_SIZE) as f32,
+                    (origin_chunk.z * CHUNK_SIZE) as f32,
+                    (CHUNK_SIZE * factor) as f32,
+                    sample_offset as f32,
+                ],
+            };
+
+            for z in 0..LOD_GRID_SIZE {
+                for x in 0..LOD_GRID_SIZE {
+                    let global_chunk_x = origin_chunk.x + x * factor;
+                    let global_chunk_z = origin_chunk.z + z * factor;
+                    let key = LodSectionKey {
+                        detail: detail as u8,
+                        x: global_chunk_x.div_euclid(LOD_SECTION_SIDE * factor),
+                        z: global_chunk_z.div_euclid(LOD_SECTION_SIDE * factor),
+                    };
+                    self.active.insert(key);
+                }
+            }
+        }
+
+        for key in self.active.iter().copied() {
+            if let Some(parent) = key.parent() {
+                debug_assert_eq!(parent.factor(), key.factor() * 2);
+            }
+            if self.cached.contains_key(&key) || !self.queued.insert(key) {
+                continue;
+            }
+            let (minimum_x, minimum_z) = key.world_minimum();
+            let request = LodGenerationRequest {
+                key,
+                priority: ((minimum_x.div_euclid(CHUNK_SIZE) - center.x).abs()
+                    + (minimum_z.div_euclid(CHUNK_SIZE) - center.z).abs()),
+            };
+            // The worker cannot disappear while this tree owns the receiver;
+            // a disconnect would be a programming error, not a recoverable
+            // missing terrain condition.
+            self.requests
+                .send(request)
+                .expect("Distant Horizons data worker stopped unexpectedly");
+        }
+        self.pack_visible_sources(lod_samples);
+        self.prune_memory_cache(center);
+    }
+
+    /// Moves completed I/O/generation work into the data source cache.  It is
+    /// intentionally non-blocking: walking across a chunk never waits for a
+    /// far terrain build.
+    fn collect_completed(&mut self, lod_samples: &mut [u32]) -> bool {
+        let mut changed = false;
+        while let Ok(section) = self.completed.try_recv() {
+            self.queued.remove(&section.key);
+            if self.active.contains(&section.key) {
+                changed |= self
+                    .cached
+                    .get(&section.key)
+                    .is_none_or(|previous| previous.columns != section.columns);
+            }
+            self.cached.insert(section.key, section);
+        }
+        if changed {
+            self.pack_visible_sources(lod_samples);
+        }
+        changed
+    }
+
+    fn pack_visible_sources(&self, lod_samples: &mut [u32]) {
+        let Some(center) = self.center else {
+            return;
+        };
+        let samples_per_level = (LOD_GRID_SIZE * LOD_GRID_SIZE) as usize;
+        lod_samples.fill(0);
+        for (detail, factor) in LOD_LEVEL_FACTORS.iter().copied().enumerate() {
+            let half_width = LOD_GRID_SIZE / 2;
+            let origin_chunk = ChunkPos {
+                x: center.x - half_width * factor,
+                z: center.z - half_width * factor,
+            };
+            let sample_offset = detail * samples_per_level;
+            for z in 0..LOD_GRID_SIZE {
+                for x in 0..LOD_GRID_SIZE {
+                    let global_chunk_x = origin_chunk.x + x * factor;
+                    let global_chunk_z = origin_chunk.z + z * factor;
+                    let key = LodSectionKey {
+                        detail: detail as u8,
+                        x: global_chunk_x.div_euclid(LOD_SECTION_SIDE * factor),
+                        z: global_chunk_z.div_euclid(LOD_SECTION_SIDE * factor),
+                    };
+                    let local_x = global_chunk_x
+                        .rem_euclid(LOD_SECTION_SIDE * factor)
+                        .div_euclid(factor) as usize;
+                    let local_z = global_chunk_z
+                        .rem_euclid(LOD_SECTION_SIDE * factor)
+                        .div_euclid(factor) as usize;
+                    if let Some(section) = self.cached.get(&key) {
+                        lod_samples[sample_offset + (x + LOD_GRID_SIZE * z) as usize] =
+                            section.columns[local_x + LOD_SECTION_SIDE as usize * local_z];
+                    }
+                }
+            }
+        }
+    }
+
+    fn prune_memory_cache(&mut self, center: ChunkPos) {
+        self.cached.retain(|key, _| {
+            let (minimum_x, minimum_z) = key.world_minimum();
+            let section_radius = LOD_SECTION_SIDE * key.factor() / CHUNK_SIZE;
+            (minimum_x.div_euclid(CHUNK_SIZE) - center.x).abs() <= LOD_RADIUS + section_radius * 3
+                && (minimum_z.div_euclid(CHUNK_SIZE) - center.z).abs()
+                    <= LOD_RADIUS + section_radius * 3
+        });
+    }
+}
+
+fn lod_cache_root() -> PathBuf {
+    PathBuf::from(LOD_CACHE_FOLDER)
+}
+
+fn lod_cache_path(key: LodSectionKey) -> PathBuf {
+    lod_cache_root()
+        .join(format!("v{LOD_CACHE_VERSION}"))
+        .join(format!("detail-{}", key.detail))
+        .join(format!("{}_{}.lod", key.x, key.z))
+}
+
+fn read_i32(bytes: &[u8], offset: usize) -> i32 {
+    i32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("four cache bytes"),
+    )
+}
+
+fn load_lod_section(key: LodSectionKey) -> Option<LodSection> {
+    let bytes = fs::read(lod_cache_path(key)).ok()?;
+    let header_size = 20;
+    if bytes.len() != header_size + LOD_SECTION_COLUMN_COUNT * std::mem::size_of::<u32>()
+        || bytes[0..4] != LOD_CACHE_MAGIC
+        || u32::from_le_bytes(bytes[4..8].try_into().ok()?) != LOD_CACHE_VERSION
+        || bytes[8] != key.detail
+        || read_i32(&bytes, 12) != key.x
+        || read_i32(&bytes, 16) != key.z
+    {
+        return None;
+    }
+    let columns = bytes[header_size..]
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four column bytes")))
+        .collect();
+    Some(LodSection { key, columns })
+}
+
+fn save_lod_section(section: &LodSection) {
+    let path = lod_cache_path(section.key);
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let mut bytes = Vec::with_capacity(20 + section.columns.len() * std::mem::size_of::<u32>());
+    bytes.extend_from_slice(&LOD_CACHE_MAGIC);
+    bytes.extend_from_slice(&LOD_CACHE_VERSION.to_le_bytes());
+    bytes.push(section.key.detail);
+    bytes.extend_from_slice(&[0; 3]);
+    bytes.extend_from_slice(&section.key.x.to_le_bytes());
+    bytes.extend_from_slice(&section.key.z.to_le_bytes());
+    for column in &section.columns {
+        bytes.extend_from_slice(&column.to_le_bytes());
+    }
+    // A cache is an optimisation.  A denied or full disk must never prevent
+    // the procedural source from appearing in this session.
+    let _ = fs::write(path, bytes);
+}
+
+fn pack_lod_column(height: u16, top_material: u32, side_material: u32) -> u32 {
+    u32::from(height) | (top_material << 16) | (side_material << 24)
+}
+
+fn generate_lod_section(key: LodSectionKey) -> LodSection {
+    let factor = key.factor();
+    let cell_size = CHUNK_SIZE * factor;
+    let (minimum_x, minimum_z) = key.world_minimum();
+    let mut columns = Vec::with_capacity(LOD_SECTION_COLUMN_COUNT);
+    for z in 0..LOD_SECTION_SIDE {
+        for x in 0..LOD_SECTION_SIDE {
+            let center_x = minimum_x + x * cell_size + cell_size / 2;
+            let center_z = minimum_z + z * cell_size + cell_size / 2;
+            // Full data records a compact vertical column.  Sampling the
+            // centre and four in-cell extrema keeps a coarse source tied to
+            // the detailed height field instead of a separately generated
+            // far-world noise function.
+            let sample_offset = (cell_size / 3).max(1);
+            let samples = [
+                terrain_height_units(center_x, center_z),
+                terrain_height_units(center_x - sample_offset, center_z),
+                terrain_height_units(center_x + sample_offset, center_z),
+                terrain_height_units(center_x, center_z - sample_offset),
+                terrain_height_units(center_x, center_z + sample_offset),
+            ];
+            let lowest = *samples.iter().min().expect("LOD samples are nonempty");
+            let highest = *samples.iter().max().expect("LOD samples are nonempty");
+            let average =
+                samples.iter().map(|height| u32::from(*height)).sum::<u32>() / samples.len() as u32;
+            // The tallest sample preserves ridges at a distance, while a
+            // single valley does not punch a visible hole into a coarse cell.
+            let height = u16::try_from((average * 2 + u32::from(highest)) / 3)
+                .expect("terrain height fits u16");
+            let slope = highest - lowest;
+            let top_material = if height <= 10 * 16 {
+                WATER
+            } else if height > 19 * 16 && slope > 12 {
+                STONE
+            } else {
+                GRASS
+            };
+            let side_material = if top_material == WATER {
+                WATER
+            } else if slope > (8 * factor) as u16 || height > 21 * 16 {
+                STONE
+            } else {
+                DIRT
+            };
+            columns.push(pack_lod_column(height, top_material, side_material));
+        }
+    }
+    LodSection { key, columns }
+}
+
+fn lod_generation_worker(
+    requests: mpsc::Receiver<LodGenerationRequest>,
+    completed: mpsc::Sender<LodSection>,
+) {
+    let mut pending = BinaryHeap::new();
+    loop {
+        if pending.is_empty() {
+            let Ok(request) = requests.recv() else {
+                return;
+            };
+            pending.push(request);
+        }
+        while let Ok(request) = requests.try_recv() {
+            pending.push(request);
+        }
+        let request = pending.pop().expect("nonempty LOD priority queue");
+        let section = load_lod_section(request.key).unwrap_or_else(|| {
+            let section = generate_lod_section(request.key);
+            save_lod_section(&section);
+            section
+        });
+        if completed.send(section).is_err() {
+            return;
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
@@ -1187,8 +1884,9 @@ struct World {
     detailed_blocks: Vec<Block>,
     lod_samples: Vec<u32>,
     lod_levels: [GpuLodLevel; LOD_LEVEL_COUNT],
+    lod_tree: LodQuadTree,
     gpu_trees: Vec<GpuTree>,
-    gpu_branches: Vec<GpuBranch>,
+    gpu_tree_segments: Vec<GpuTreeSegment>,
     tree_count: usize,
     growth_time: f32,
     last_tree_tick: f32,
@@ -1207,8 +1905,9 @@ impl World {
             ],
             lod_samples: vec![0; LOD_SAMPLE_COUNT],
             lod_levels: [GpuLodLevel::zeroed(); LOD_LEVEL_COUNT],
+            lod_tree: LodQuadTree::new(),
             gpu_trees: vec![GpuTree::zeroed(); MAX_TREES],
-            gpu_branches: vec![GpuBranch::zeroed(); MAX_GPU_BRANCHES],
+            gpu_tree_segments: vec![GpuTreeSegment::zeroed(); MAX_GPU_TREE_SEGMENTS],
             tree_count: 0,
             growth_time: 0.0,
             last_tree_tick: 0.0,
@@ -1341,6 +2040,12 @@ impl World {
         }
     }
 
+    /// Integrates completed distant-data jobs without stalling the frame.
+    /// The caller uploads the compact buffer only when this returns true.
+    fn collect_lod_updates(&mut self) -> bool {
+        self.lod_tree.collect_completed(&mut self.lod_samples)
+    }
+
     fn rebuild_detailed_buffer(&mut self) {
         let width = (DETAIL_DIAMETER * CHUNK_SIZE) as usize;
         let depth = width;
@@ -1375,8 +2080,8 @@ impl World {
     }
 
     /// Projects Dynamic Trees' dynamic leaf blocks into the streamed DDA
-    /// volume. Branches use the exact core-and-sleeve model in the separate
-    /// branch buffer, while leaves retain their normal full block shape.
+    /// volume. Wood is rendered by the separate HPD segment buffer;
+    /// leaves remain full dynamic voxels with their per-species atlas tile.
     fn paint_dynamic_trees(&mut self) {
         let mut leaf_cells = Vec::new();
         let mut rooty_soil_cells = Vec::new();
@@ -1391,7 +2096,12 @@ impl World {
                     .get(&position)
                     .expect("the detail window was streamed before trees were packed");
                 for tree in &chunk.trees {
-                    leaf_cells.extend(tree.leaves.keys().copied());
+                    leaf_cells.extend(
+                        tree.leaves
+                            .keys()
+                            .copied()
+                            .map(|position| (position, tree.form.leaf_material())),
+                    );
                     rooty_soil_cells.push(tree.root);
                 }
             }
@@ -1418,11 +2128,11 @@ impl World {
                 self.detailed_blocks[index] = block(ROOTY_SOIL, height);
             }
         }
-        for position in leaf_cells {
+        for (position, material) in leaf_cells {
             if let Some(index) = cell_index(position)
                 && self.detailed_blocks[index] == AIR
             {
-                self.detailed_blocks[index] = block(TREE_LEAVES, 16);
+                self.detailed_blocks[index] = block(material, 16);
             }
         }
     }
@@ -1443,39 +2153,15 @@ impl World {
         let center = self
             .center
             .expect("LOD data is built after the stream center is set");
-        let samples_per_level = (LOD_GRID_SIZE * LOD_GRID_SIZE) as usize;
-        for (level, factor) in LOD_LEVEL_FACTORS.iter().copied().enumerate() {
-            let half_width = LOD_GRID_SIZE / 2;
-            let origin_chunk = ChunkPos {
-                x: center.x - half_width * factor,
-                z: center.z - half_width * factor,
-            };
-            let cell_size = CHUNK_SIZE * factor;
-            let sample_offset = level * samples_per_level;
-            self.lod_levels[level] = GpuLodLevel {
-                data: [
-                    (origin_chunk.x * CHUNK_SIZE) as f32,
-                    (origin_chunk.z * CHUNK_SIZE) as f32,
-                    cell_size as f32,
-                    sample_offset as f32,
-                ],
-            };
-            for z in 0..LOD_GRID_SIZE {
-                for x in 0..LOD_GRID_SIZE {
-                    let world_x = origin_chunk.x * CHUNK_SIZE + x * cell_size + cell_size / 2;
-                    let world_z = origin_chunk.z * CHUNK_SIZE + z * cell_size + cell_size / 2;
-                    self.lod_samples[sample_offset + (x + LOD_GRID_SIZE * z) as usize] =
-                        u32::from(terrain_height_units(world_x, world_z));
-                }
-            }
-        }
+        self.lod_tree
+            .center_on(center, &mut self.lod_samples, &mut self.lod_levels);
     }
 
     fn rebuild_tree_buffer(&mut self) {
         self.gpu_trees.fill(GpuTree::zeroed());
-        self.gpu_branches.fill(GpuBranch::zeroed());
+        self.gpu_tree_segments.fill(GpuTreeSegment::zeroed());
         let mut tree_index = 0;
-        let mut branch_index = 0;
+        let mut segment_index = 0;
 
         'trees: for chunk_z in 0..DETAIL_DIAMETER {
             for chunk_x in 0..DETAIL_DIAMETER {
@@ -1491,27 +2177,40 @@ impl World {
                     if tree_index >= MAX_TREES {
                         break 'trees;
                     }
-                    let start = branch_index;
+                    let segments = tree.eco_machina_segments();
+                    if segments.is_empty() {
+                        continue;
+                    }
+                    assert!(
+                        segments.len() <= MAX_RENDER_SEGMENTS_PER_TREE,
+                        "Eco Machina segment budget exceeded for one tree"
+                    );
+                    assert!(
+                        segment_index + segments.len() <= MAX_GPU_TREE_SEGMENTS,
+                        "Eco Machina segment buffer exhausted"
+                    );
+                    let start = segment_index;
                     let mut minimum = Vec3::splat(f32::INFINITY);
                     let mut maximum = Vec3::splat(f32::NEG_INFINITY);
-                    for (&branch_position, &radius) in &tree.branches {
-                        if branch_index >= MAX_GPU_BRANCHES {
-                            break 'trees;
-                        }
-                        let centre = branch_position.as_vec3() + Vec3::splat(0.5);
-                        let branch_radius = f32::from(radius) / 16.0;
-                        let render_extent = branch_radius.max(1.0);
-                        minimum =
-                            minimum.min(centre - Vec3::new(render_extent, 1.0, render_extent));
-                        maximum =
-                            maximum.max(centre + Vec3::new(render_extent, 1.0, render_extent));
-                        self.gpu_branches[branch_index] = GpuBranch {
-                            centre_radius: [centre.x, centre.y, centre.z, branch_radius],
-                            connections: tree.connection_radii(branch_position, radius),
-                        };
-                        branch_index += 1;
+                    for segment in segments {
+                        let start_point = Vec3::from_array([
+                            segment.start_radius[0],
+                            segment.start_radius[1],
+                            segment.start_radius[2],
+                        ]);
+                        let end_point = Vec3::from_array([
+                            segment.end_radius[0],
+                            segment.end_radius[1],
+                            segment.end_radius[2],
+                        ]);
+                        let radius = segment.start_radius[3].max(segment.end_radius[3]);
+                        let extent = Vec3::splat(radius);
+                        minimum = minimum.min(start_point - extent).min(end_point - extent);
+                        maximum = maximum.max(start_point + extent).max(end_point + extent);
+                        self.gpu_tree_segments[segment_index] = segment;
+                        segment_index += 1;
                     }
-                    let count = branch_index - start;
+                    let count = segment_index - start;
                     if count == 0 {
                         continue;
                     }
@@ -1519,7 +2218,12 @@ impl World {
                     self.gpu_trees[tree_index] = GpuTree {
                         bounds: [centre.x, centre.y, centre.z, (maximum - centre).length()],
                         layout: [start as f32, count as f32, 0.0, 0.0],
-                        appearance: [0.0; 4],
+                        appearance: [
+                            tree.form.render_id() as f32,
+                            f32::from(tree.fertility),
+                            0.0,
+                            0.0,
+                        ],
                     };
                     tree_index += 1;
                 }
@@ -1527,6 +2231,194 @@ impl World {
         }
         self.tree_count = tree_index;
     }
+}
+
+#[derive(Deserialize)]
+struct TreeTextureSet {
+    bark: String,
+    end_grain: String,
+    leaves: String,
+}
+
+#[derive(Deserialize)]
+struct TreeTextureConfig {
+    tile_size: u32,
+    oak: TreeTextureSet,
+    spruce: TreeTextureSet,
+    acacia: TreeTextureSet,
+    connectors: [String; 6],
+}
+
+fn load_tree_texture_config() -> (PathBuf, TreeTextureConfig) {
+    let config_path = PathBuf::from(TREE_TEXTURE_CONFIG_PATH);
+    let text = fs::read_to_string(&config_path).unwrap_or_else(|error| {
+        panic!(
+            "could not read required tree texture config {}: {error}",
+            config_path.display()
+        )
+    });
+    let config = serde_json::from_str::<TreeTextureConfig>(&text).unwrap_or_else(|error| {
+        panic!(
+            "could not parse required tree texture config {}: {error}",
+            config_path.display()
+        )
+    });
+    assert_eq!(
+        config.tile_size, TREE_TEXTURE_TILE_SIZE,
+        "tree texture config must declare a {TREE_TEXTURE_TILE_SIZE}px tile"
+    );
+    let asset_dir = config_path
+        .parent()
+        .expect("tree texture config path has a parent directory")
+        .to_path_buf();
+    (asset_dir, config)
+}
+
+fn decode_tree_png(path: &Path, label: &str) -> Vec<u8> {
+    let image = image::open(path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "could not decode required {label} texture {}: {error}",
+                path.display()
+            )
+        })
+        .to_rgba8();
+    assert_eq!(
+        image.dimensions(),
+        (TREE_TEXTURE_TILE_SIZE, TREE_TEXTURE_TILE_SIZE),
+        "required {label} texture must be exactly {TREE_TEXTURE_TILE_SIZE}x{TREE_TEXTURE_TILE_SIZE}"
+    );
+    image.into_raw()
+}
+
+fn decode_alpha_tree_png(path: &Path, label: &str) -> Vec<u8> {
+    let pixels = decode_tree_png(path, label);
+    assert!(
+        pixels.chunks_exact(4).any(|pixel| pixel[3] < 255),
+        "required {label} texture must preserve transparent alpha pixels"
+    );
+    pixels
+}
+
+fn configured_tree_asset(asset_dir: &Path, relative_path: &str, label: &str) -> PathBuf {
+    let relative_path = Path::new(relative_path);
+    assert!(
+        !relative_path.is_absolute(),
+        "{label} texture path must be relative to {TREE_TEXTURE_CONFIG_PATH}"
+    );
+    let path = asset_dir.join(relative_path);
+    assert!(
+        path.is_file(),
+        "required {label} texture is missing: {}",
+        path.display()
+    );
+    path
+}
+
+fn blit_tree_tile(atlas: &mut [u8], atlas_width: u32, tile_x: u32, tile_y: u32, source: &[u8]) {
+    let row_bytes = (TREE_TEXTURE_TILE_SIZE * 4) as usize;
+    for source_y in 0..TREE_TEXTURE_TILE_SIZE as usize {
+        let source_start = source_y * row_bytes;
+        let target_x = tile_x * TREE_TEXTURE_TILE_SIZE;
+        let target_y = tile_y * TREE_TEXTURE_TILE_SIZE + source_y as u32;
+        let target_start = ((target_x + target_y * atlas_width) * 4) as usize;
+        atlas[target_start..target_start + row_bytes]
+            .copy_from_slice(&source[source_start..source_start + row_bytes]);
+    }
+}
+
+/// Produces the immutable tree-material atlas consumed by the ray tracer.
+/// The supplied oak/spruce bark, end-grain, alpha leaf textures, and six
+/// foliage connectors are mandatory embedded assets. Acacia keeps its
+/// deterministic authored atlas tiles until matching source PNGs are supplied.
+fn generate_tree_texture_atlas() -> (Vec<u8>, u32, u32) {
+    let width = TREE_TEXTURE_TILE_SIZE * TREE_TEXTURE_COLUMNS;
+    let height = TREE_TEXTURE_TILE_SIZE * TREE_TEXTURE_ROWS;
+    let mut pixels = vec![0_u8; (width * height * 4) as usize];
+
+    // All occupied atlas tiles are external runtime assets. The zeroed pixels
+    // in unused slots never participate in a material lookup.
+    let (asset_dir, config) = load_tree_texture_config();
+    let species = [
+        ("oak", &config.oak, 0_u32),
+        ("spruce", &config.spruce, 1_u32),
+        ("acacia", &config.acacia, 2_u32),
+    ];
+    for (name, textures, column) in species {
+        let bark_label = format!("{name} bark");
+        let bark_path = configured_tree_asset(&asset_dir, &textures.bark, &bark_label);
+        let end_grain_label = format!("{name} end grain");
+        let end_grain_path =
+            configured_tree_asset(&asset_dir, &textures.end_grain, &end_grain_label);
+        let leaves_label = format!("{name} leaves");
+        let leaves_path = configured_tree_asset(&asset_dir, &textures.leaves, &leaves_label);
+        let bark = decode_tree_png(&bark_path, &bark_label);
+        let end_grain = decode_tree_png(&end_grain_path, &end_grain_label);
+        let leaves = decode_alpha_tree_png(&leaves_path, &leaves_label);
+        blit_tree_tile(&mut pixels, width, column, 0, &bark);
+        blit_tree_tile(&mut pixels, width, column, 1, &end_grain);
+        blit_tree_tile(&mut pixels, width, column + 3, 0, &leaves);
+    }
+
+    let connector_tiles = [(3_u32, 1_u32), (4, 1), (5, 1), (0, 2), (1, 2), (2, 2)];
+    for (index, ((tile_x, tile_y), relative_path)) in connector_tiles
+        .into_iter()
+        .zip(config.connectors.iter())
+        .enumerate()
+    {
+        let label = format!("connector-{}", index + 1);
+        let path = configured_tree_asset(&asset_dir, relative_path, &label);
+        let connector = decode_alpha_tree_png(&path, &label);
+        blit_tree_tile(&mut pixels, width, tile_x, tile_y, &connector);
+    }
+    (pixels, width, height)
+}
+
+fn create_tree_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+    let (pixels, width, height) = generate_tree_texture_atlas();
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("externally configured tree material atlas"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        texture.size(),
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("tree texture atlas sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    (texture, view, sampler)
 }
 
 fn hash_u32(mut value: u32) -> u32 {
@@ -1599,8 +2491,8 @@ fn generate_chunk(position: ChunkPos) -> Chunk {
     }
 
     let mut trees = Vec::new();
-    // Each chunk can grow one or two independent trees. Their branch cells
-    // retain the Dynamic Trees core/sleeve shape instead of becoming cubes.
+    // Each chunk can grow one or two independent Dynamic Trees graphs. The
+    // renderer later decomposes them into Eco Machina HPD chains.
     for tree_slot in 0..2 {
         let h = hash_2d(position.x, position.z, 0x4d3b_1f01 + tree_slot);
         if h % 100 >= 72 {
@@ -1710,7 +2602,7 @@ struct State {
     lod_buffer: wgpu::Buffer,
     lod_info_buffer: wgpu::Buffer,
     tree_buffer: wgpu::Buffer,
-    branch_buffer: wgpu::Buffer,
+    tree_segment_buffer: wgpu::Buffer,
     camera: Camera,
     world: World,
     world_time: f32,
@@ -1761,7 +2653,7 @@ impl State {
         );
         let lod_buffer = storage_buffer(
             &device,
-            "distant horizons clipmap heights",
+            "Distant Horizons full-data columns",
             &world.lod_samples,
         );
         let lod_info_buffer = storage_buffer(
@@ -1770,8 +2662,13 @@ impl State {
             &world.lod_levels,
         );
         let tree_buffer = storage_buffer(&device, "Dynamic Trees bounds", &world.gpu_trees);
-        let branch_buffer =
-            storage_buffer(&device, "dynamic tree branch graph", &world.gpu_branches);
+        let tree_segment_buffer = storage_buffer(
+            &device,
+            "eco machina hpd tree segments",
+            &world.gpu_tree_segments,
+        );
+        let (_tree_texture, tree_texture_view, tree_texture_sampler) =
+            create_tree_texture(&device, &queue);
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ray world bind group layout"),
@@ -1782,6 +2679,22 @@ impl State {
                 buffer_layout_entry(3, wgpu::BufferBindingType::Storage { read_only: true }),
                 buffer_layout_entry(4, wgpu::BufferBindingType::Storage { read_only: true }),
                 buffer_layout_entry(5, wgpu::BufferBindingType::Storage { read_only: true }),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1810,7 +2723,15 @@ impl State {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: branch_buffer.as_entire_binding(),
+                    resource: tree_segment_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&tree_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&tree_texture_sampler),
                 },
             ],
         });
@@ -1862,7 +2783,7 @@ impl State {
             lod_buffer,
             lod_info_buffer,
             tree_buffer,
-            branch_buffer,
+            tree_segment_buffer,
             camera,
             world,
             world_time: 18.0,
@@ -1884,13 +2805,14 @@ impl State {
         self.world_time += seconds;
         let terrain_changed = self.world.stream_around(self.camera.position);
         let trees_changed = self.world.advance(seconds);
+        let lod_changed = self.world.collect_lod_updates();
         if terrain_changed || trees_changed {
             self.queue.write_buffer(
                 &self.detail_buffer,
                 0,
                 bytemuck::cast_slice(&self.world.detailed_blocks),
             );
-            if terrain_changed {
+            if terrain_changed || lod_changed {
                 self.queue.write_buffer(
                     &self.lod_buffer,
                     0,
@@ -1903,6 +2825,13 @@ impl State {
                 );
             }
         }
+        if lod_changed && !(terrain_changed || trees_changed) {
+            self.queue.write_buffer(
+                &self.lod_buffer,
+                0,
+                bytemuck::cast_slice(&self.world.lod_samples),
+            );
+        }
         if terrain_changed || trees_changed {
             self.queue.write_buffer(
                 &self.tree_buffer,
@@ -1910,9 +2839,9 @@ impl State {
                 bytemuck::cast_slice(&self.world.gpu_trees),
             );
             self.queue.write_buffer(
-                &self.branch_buffer,
+                &self.tree_segment_buffer,
                 0,
-                bytemuck::cast_slice(&self.world.gpu_branches),
+                bytemuck::cast_slice(&self.world.gpu_tree_segments),
             );
         }
 
@@ -2001,7 +2930,7 @@ impl State {
 
     fn status(&self) -> String {
         format!(
-            "RayVoxel — {} detailed chunks · 256-chunk LOD horizon · {} Dynamic Trees (block mode)",
+            "RayVoxel — {} detailed chunks · 256-chunk LOD horizon · {} Dynamic Trees (Eco Machina)",
             self.world.detailed.len(),
             self.world.active_tree_count()
         )
@@ -2165,6 +3094,47 @@ mod tests {
     }
 
     #[test]
+    fn lod_sources_follow_quadtree_parent_addresses() {
+        let child = LodSectionKey {
+            detail: 2,
+            x: -3,
+            z: 5,
+        };
+        assert_eq!(
+            child.parent(),
+            Some(LodSectionKey {
+                detail: 3,
+                x: -2,
+                z: 2,
+            })
+        );
+        let outermost = LodSectionKey {
+            detail: LOD_LEVEL_COUNT as u8 - 1,
+            x: 0,
+            z: 0,
+        };
+        assert!(outermost.parent().is_none());
+    }
+
+    #[test]
+    fn lod_full_data_keeps_surface_and_cliff_materials() {
+        let section = generate_lod_section(LodSectionKey {
+            detail: 1,
+            x: 0,
+            z: 0,
+        });
+        assert_eq!(section.columns.len(), LOD_SECTION_COLUMN_COUNT);
+        assert!(section.columns.iter().all(|packed| {
+            let height = packed & 65535;
+            let top = (packed >> 16) & 255;
+            let side = (packed >> 24) & 255;
+            height > 0
+                && matches!(top, GRASS | STONE | WATER)
+                && matches!(side, DIRT | STONE | WATER)
+        }));
+    }
+
+    #[test]
     fn dynamic_tree_uses_branch_and_leaf_cells() {
         let mut tree = Tree::new(IVec3::new(0, 12, 0), 0x1234_5678);
         let initial_branches = tree.branches.len();
@@ -2270,7 +3240,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_connections_clamp_and_rooty_soil_connects_like_dynamic_trees() {
+    fn eco_machina_hpd_uses_dynamic_trees_radius_directly() {
         let root = IVec3::new(0, 12, 0);
         let mut tree = Tree::new(root, 0);
         tree.branches.clear();
@@ -2279,9 +3249,51 @@ mod tests {
         let branch = root + IVec3::Y;
         tree.branches.insert(branch, 3);
         tree.branches.insert(branch + IVec3::Y, 7);
-        tree.leaves.insert(branch + IVec3::X, 4);
-        assert_eq!(tree.connection_radii(branch, 3), [3, 3, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(tree.connection_radii(branch, 1), [1, 1, 0, 0, 0, 1, 0, 0]);
+        let segments = tree.eco_machina_segments();
+
+        // Two individual wood-block spines. Their half-widths are the actual
+        // DT radii 3/16 and 7/16, not a synthetic chain-length taper.
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].style[1], SEGMENT_WOOD_SPINE);
+        assert_eq!(segments[1].style[1], SEGMENT_WOOD_SPINE);
+        assert_eq!(segments[0].style[0], tree.form.render_id());
+        assert_eq!(segments[0].start_radius, [0.5, 13.0, 0.5, 3.0 / 16.0]);
+        assert_eq!(segments[0].end_radius, [0.5, 14.0, 0.5, 3.0 / 16.0]);
+        assert_eq!(segments[1].start_radius, [0.5, 14.0, 0.5, 7.0 / 16.0]);
+        assert_eq!(segments[1].end_radius, [0.5, 15.0, 0.5, 7.0 / 16.0]);
+    }
+
+    #[test]
+    fn eco_machina_hpd_connects_only_secondary_chains_from_spine_in() {
+        let root = IVec3::new(0, 12, 0);
+        let mut tree = Tree::new(root, 0);
+        tree.branches.clear();
+        tree.leaves.clear();
+        let trunk = root + IVec3::Y;
+        tree.branches.insert(trunk, 8);
+        tree.branches.insert(trunk + IVec3::Y, 6);
+        tree.branches.insert(trunk + IVec3::Y * 2, 4);
+        tree.branches.insert(trunk + IVec3::X, 5);
+
+        let mut nodes = tree.build_hpd_nodes();
+        Tree::compute_subtree_weights(&mut nodes, 0);
+        let mut chain_count = 1;
+        Tree::assign_hpd_chains(&mut nodes, 0, 0, 0, 0, &mut chain_count);
+        let side = nodes
+            .iter()
+            .position(|node| node.position == trunk + IVec3::X)
+            .expect("secondary Dynamic Trees branch is in the visualizer graph");
+        assert_eq!(nodes[side].chain_depth, 1);
+        assert_eq!(nodes[side].position_in_chain, 0);
+        assert_eq!(nodes[side].dt_radius, 5);
+
+        let segments = tree.eco_machina_segments();
+        let connector = segments
+            .iter()
+            .find(|segment| segment.style[1] == SEGMENT_WOOD_CONNECTOR)
+            .expect("one non-primary child gets the visualizer connector");
+        assert_eq!(connector.start_radius, [0.5, 13.0, 0.5, 5.0 / 16.0]);
+        assert_eq!(connector.end_radius, [1.0, 13.5, 0.5, 5.0 / 16.0]);
     }
 
     #[test]
@@ -2411,8 +3423,9 @@ mod tests {
     }
 
     #[test]
-    fn gpu_branch_layout_matches_wgsl_branch_cell_stride() {
-        assert_eq!(std::mem::size_of::<GpuBranch>(), 48);
-        assert_eq!(std::mem::offset_of!(GpuBranch, connections), 16);
+    fn gpu_tree_segment_layout_matches_wgsl_storage_stride() {
+        assert_eq!(std::mem::size_of::<GpuTreeSegment>(), 48);
+        assert_eq!(std::mem::offset_of!(GpuTreeSegment, end_radius), 16);
+        assert_eq!(std::mem::offset_of!(GpuTreeSegment, style), 32);
     }
 }
