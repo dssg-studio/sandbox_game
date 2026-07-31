@@ -21,9 +21,8 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> detail_blocks: array<u32>;
-// 1/16th top height in bits 0..15, top material in 16..23 and cliff
-// material in 24..31.  These are compact full-data columns, not a bare
-// height-only horizon map.
+// DH-style column render data. Each X/Z column contains up to six packed
+// vertical material slices rather than a single top height.
 @group(0) @binding(2) var<storage, read> lod_columns: array<u32>;
 // Three vec4s per tree: bounds, segment range/BLAS root, appearance.
 @group(0) @binding(3) var<storage, read> trees: array<vec4<f32>>;
@@ -155,12 +154,19 @@ struct RayInterval {
     found: bool,
 };
 
+struct LodRenderSlice {
+    bottom: f32,
+    top: f32,
+    top_material: u32,
+    side_material: u32,
+    found: bool,
+};
+
 struct LodColumn {
     minimum: vec2<f32>,
     cell_size: f32,
-    height: f32,
-    top_material: u32,
-    side_material: u32,
+    slice_offset: u32,
+    slice_count: u32,
     found: bool,
 };
 
@@ -297,8 +303,36 @@ fn leaf_texture_is_opaque(material: u32, point: vec3<f32>, normal: vec3<f32>) ->
     return alpha >= 0.5;
 }
 
+fn lod_slice_count_for_level(level: u32) -> u32 {
+    // Same MEDIUM vertical profile as DH for the five active data-detail
+    // levels: 6, 6, 6, 4, 4.
+    if level < 3u {
+        return 6u;
+    }
+    return 4u;
+}
+
+fn unpack_lod_render_slice(packed: u32) -> LodRenderSlice {
+    if packed == 0u {
+        return LodRenderSlice(0.0, 0.0, AIR, AIR, false);
+    }
+    return LodRenderSlice(
+        f32(packed & 1023u) / 16.0,
+        f32((packed >> 10u) & 1023u) / 16.0,
+        (packed >> 20u) & 63u,
+        (packed >> 26u) & 63u,
+        true,
+    );
+}
+
 fn no_lod_column() -> LodColumn {
-    return LodColumn(vec2<f32>(0.0), 0.0, 0.0, AIR, AIR, false);
+    return LodColumn(
+        vec2<f32>(0.0),
+        0.0,
+        0u,
+        0u,
+        false,
+    );
 }
 
 // The first *loaded* level that contains the point wins.  While a finer
@@ -317,15 +351,14 @@ fn lod_column_at(point: vec2<f32>) -> LodColumn {
         if local.x >= 0.0 && local.y >= 0.0 && local.x < extent && local.y < extent {
             let x = u32(floor(local.x / info.z));
             let z = u32(floor(local.y / info.z));
-            let index = u32(info.w) + x + u32(grid_side) * z;
-            let packed = lod_columns[index];
-            if packed != 0u {
+            let sample_index = u32(info.w) + x + u32(grid_side) * z;
+            let slice_offset = sample_index * 6u;
+            if lod_columns[slice_offset] != 0u {
                 return LodColumn(
                     info.xy + vec2<f32>(f32(x) * info.z, f32(z) * info.z),
                     info.z,
-                    f32(packed & 65535u) / 16.0,
-                    (packed >> 16u) & 255u,
-                    (packed >> 24u) & 255u,
+                    slice_offset,
+                    lod_slice_count_for_level(level),
                     true,
                 );
             }
@@ -601,12 +634,66 @@ fn detailed_world_exit_distance(point: vec2<f32>, direction: vec2<f32>) -> f32 {
     return min(exit_x, exit_z);
 }
 
+fn lod_layer_uv(point: vec3<f32>, normal: vec3<f32>) -> vec2<f32> {
+    // Distant tree envelopes have no individual HPD orientation left after
+    // reduction.  A world-stable planar projection preserves bark/leaf detail
+    // without introducing a per-cell texture seam.
+    if abs(normal.y) > 0.5 {
+        return fract(point.xz);
+    }
+    if abs(normal.x) > abs(normal.z) {
+        return fract(vec2<f32>(point.z, point.y) * 0.35);
+    }
+    return fract(vec2<f32>(point.x, point.y) * 0.35);
+}
+
+fn trace_lod_render_slice(
+    ro: vec3<f32>, rd: vec3<f32>, column: LodColumn, slice: LodRenderSlice,
+    min_distance: f32, max_distance: f32,
+) -> Hit {
+    if !slice.found {
+        return empty_hit(max_distance);
+    }
+    let candidate = ray_box(
+        ro,
+        rd,
+        vec3<f32>(column.minimum.x, slice.bottom, column.minimum.y),
+        vec3<f32>(
+            column.minimum.x + column.cell_size,
+            slice.top,
+            column.minimum.y + column.cell_size,
+        ),
+    );
+    if !candidate.found || candidate.t < min_distance - 0.01 || candidate.t >= max_distance {
+        return empty_hit(max_distance);
+    }
+    let point = ro + rd * candidate.t;
+    let material = select(
+        slice.side_material,
+        slice.top_material,
+        candidate.normal.y > 0.5,
+    );
+    if material >= OAK_LEAVES && material <= ACACIA_LEAVES
+        && !leaf_texture_is_opaque(material, point, candidate.normal)
+    {
+        return empty_hit(max_distance);
+    }
+    return Hit(
+        candidate.t,
+        candidate.normal,
+        material,
+        lod_layer_uv(point, candidate.normal),
+        true,
+    );
+}
+
 // Traverses the current clipmap cell and then selects a coarser grid as the
-// ray leaves each level.  The clipmap deliberately has a hole over the exact
-// 9×9 detailed window: the two representations must never overlap there.
-// Otherwise a low detailed slab can start *inside* a taller averaged LOD box,
-// producing a false self-shadow.
-fn trace_lod(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
+// ray leaves each level.  Shadow and AO rays keep a hole over the exact 9×9
+// detailed window so a coarse averaged slab cannot shadow the precise one.
+// Primary rays may opt into the overlap only for DH-style dithered hand-off.
+fn trace_lod_internal(
+    ro: vec3<f32>, rd: vec3<f32>, max_distance: f32, include_detailed_window: bool,
+) -> Hit {
     if abs(rd.x) + abs(rd.z) < 0.002 {
         return empty_hit(max_distance);
     }
@@ -617,7 +704,7 @@ fn trace_lod(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
             break;
         }
         let point = ro + rd * travelled;
-        if point_is_inside_detailed_world(point.xz) {
+        if !include_detailed_window && point_is_inside_detailed_world(point.xz) {
             let exit_distance = detailed_world_exit_distance(point.xz, rd.xz);
             if exit_distance >= 1.0e29 {
                 break;
@@ -630,23 +717,23 @@ fn trace_lod(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
         if !column.found {
             break;
         }
-        let candidate = ray_box(
-            ro,
-            rd,
-            vec3<f32>(column.minimum.x, 0.0, column.minimum.y),
-            vec3<f32>(
-                column.minimum.x + column.cell_size,
-                column.height,
-                column.minimum.y + column.cell_size,
-            ),
-        );
-        if candidate.found && candidate.t >= travelled - 0.01 && candidate.t < max_distance {
-            let material = select(
-                column.side_material,
-                column.top_material,
-                candidate.normal.y > 0.5,
+        var closest = empty_hit(max_distance);
+        var slice_index = 0u;
+        loop {
+            if slice_index >= column.slice_count {
+                break;
+            }
+            let slice = unpack_lod_render_slice(lod_columns[column.slice_offset + slice_index]);
+            let candidate = trace_lod_render_slice(
+                ro, rd, column, slice, travelled, max_distance,
             );
-            return Hit(candidate.t, candidate.normal, material, vec2<f32>(0.0), true);
+            if candidate.found && (!closest.found || candidate.t < closest.t) {
+                closest = candidate;
+            }
+            slice_index += 1u;
+        }
+        if closest.found {
+            return closest;
         }
         var exit_x = 1.0e30;
         var exit_z = 1.0e30;
@@ -664,6 +751,14 @@ fn trace_lod(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
         step_count += 1u;
     }
     return empty_hit(max_distance);
+}
+
+fn trace_lod(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
+    return trace_lod_internal(ro, rd, max_distance, false);
+}
+
+fn trace_lod_for_detail_fade(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
+    return trace_lod_internal(ro, rd, max_distance, true);
 }
 
 fn ray_aabb_entry(ro: vec3<f32>, rd: vec3<f32>, minimum: vec3<f32>, maximum: vec3<f32>) -> f32 {
@@ -1030,19 +1125,45 @@ fn trees_any_hit(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> bool {
     return false;
 }
 
+// This is the equivalent of DH's dithered vanilla-to-LOD fade.  Hashing the
+// hit's world cell (rather than a screen pixel) makes the threshold stable as
+// the camera moves, so foliage does not shimmer while it transitions.
+fn dh_detail_fade_noise(point: vec3<f32>) -> f32 {
+    let cell = floor(point.xz * 3.0);
+    return fract(sin(dot(cell, vec2<f32>(127.1, 311.7))) * 43758.5453123);
+}
+
+fn dh_detail_fade_amount(distance_to_exact_hit: f32) -> f32 {
+    // The 9×9 exact window is 144 blocks across. Start handing off well
+    // before its edge and finish after it, matching DH's fade-overlap rather
+    // than exposing a hard square cut through tree canopies.
+    return smoothstep(48.0, 104.0, distance_to_exact_hit);
+}
+
 fn trace_world(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> Hit {
-    let near_terrain = trace_blocks(ro, rd, min(max_distance, 180.0));
-    var terrain = near_terrain;
-    // A nearby exact block always wins.  The clipmap is only queried for rays
-    // leaving the detailed window, preventing coarse terrain from masking it.
-    if !near_terrain.found {
-        terrain = trace_lod(ro, rd, max_distance);
+    let exact_terrain = trace_blocks(ro, rd, min(max_distance, 180.0));
+    var exact = exact_terrain;
+    let exact_trees = trace_trees(ro, rd, exact.t);
+    if exact_trees.found {
+        exact = exact_trees;
     }
-    let trees_hit = trace_trees(ro, rd, terrain.t);
-    if trees_hit.found {
-        return trees_hit;
+
+    // The LOD side contains the same terrain/wood/leaf source data. It is
+    // queried under the detailed window only here, solely to make the two
+    // representations available during the dithered fade.
+    let distant = trace_lod_for_detail_fade(ro, rd, max_distance);
+    if !exact.found {
+        return distant;
     }
-    return terrain;
+    if !distant.found {
+        return exact;
+    }
+    let fade = dh_detail_fade_amount(exact.t);
+    let exact_point = ro + rd * exact.t;
+    if fade > 0.0 && dh_detail_fade_noise(exact_point) < fade {
+        return distant;
+    }
+    return exact;
 }
 
 fn world_any_hit(ro: vec3<f32>, rd: vec3<f32>, max_distance: f32) -> bool {

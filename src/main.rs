@@ -102,18 +102,32 @@ const DETAIL_OCCUPANCY_WORDS: usize =
 /// ready, so a stream transition has no hole or synchronous fallback path.
 const DETAIL_PREFETCH_RADIUS: i32 = DETAIL_RADIUS + 2;
 const MAX_TREES_PER_CHUNK: usize = 2;
-const LOD_GRID_SIZE: i32 = 33;
-const LOD_LEVEL_FACTORS: [i32; 5] = [1, 2, 4, 8, 16];
+/// Independent DH full-data sections are CPU work.  Two workers let the
+/// horizon fill from multiple directions without competing with the four
+/// detailed-chunk builders for the whole machine.
+const LOD_STREAM_WORKERS: usize = 2;
+/// DH-style horizontal clipmap: 4-block samples at the detailed-window edge,
+/// then powers of two out to a true 256-chunk radius.
+const LOD_GRID_SIZE: i32 = 129;
+const LOD_LEVEL_FACTORS: [i32; 5] = [4, 8, 16, 32, 64];
 const LOD_LEVEL_COUNT: usize = LOD_LEVEL_FACTORS.len();
 const LOD_SAMPLE_COUNT: usize = LOD_LEVEL_COUNT * (LOD_GRID_SIZE * LOD_GRID_SIZE) as usize;
-/// Dynamic data sources are deliberately smaller than a render grid.  This is
-/// the same division of responsibilities as DH's full-data sources: a source
-/// owns a compact square of columns and can be generated, cached and merged
-/// independently of the visible LOD cut.
-const LOD_SECTION_SIDE: i32 = 16;
+/// Matches DH's MEDIUM vertical-quality profile for the five levels we use.
+/// Each X/Z column keeps independent material spans instead of collapsing a
+/// tree to a height field.
+const LOD_VERTICAL_SLICE_COUNTS: [usize; LOD_LEVEL_COUNT] = [6, 6, 6, 4, 4];
+const LOD_MAX_VERTICAL_SLICES: usize = 6;
+const LOD_GPU_SAMPLE_COUNT: usize = LOD_SAMPLE_COUNT * LOD_MAX_VERTICAL_SLICES;
+/// Dynamic data sources have DH's 64×64 column footprint.  Each source keeps
+/// its full vertical data; the compact render slices are derived from that
+/// source independently for every LOD level.
+const LOD_SECTION_SIDE: i32 = 64;
 const LOD_SECTION_COLUMN_COUNT: usize = (LOD_SECTION_SIDE * LOD_SECTION_SIDE) as usize;
 const LOD_CACHE_MAGIC: [u8; 4] = *b"RVLH";
-const LOD_CACHE_VERSION: u32 = 1;
+// The source payload is unchanged, but v5 changes its producer from a
+// recursively-expanded leaf job to the DH-style requested-detail worldgen
+// task.  Cache entries from the previous producer must not be mixed in.
+const LOD_CACHE_VERSION: u32 = 5;
 /// Runtime cache is deliberately relative to the game directory, so a
 /// portable copy of the game keeps its distant-world data beside its assets.
 const LOD_CACHE_FOLDER: &str = "cache/distant_horizons";
@@ -400,6 +414,10 @@ impl TreeForm {
             Self::Conifer => SPRUCE_LEAVES,
             Self::Acacia => ACACIA_LEAVES,
         }
+    }
+
+    fn bark_material(self) -> u32 {
+        10 + self.render_id()
     }
 }
 
@@ -2048,16 +2066,15 @@ const ACACIA_CELL_SOLVER: [(u8, u8, u8); 5] =
 
 /// A square LOD clipmap. `origin` is the world-space lower-left corner,
 /// `cell_size` is its current LOD resolution and `sample_offset` indexes the
-/// flattened height buffer.
+/// flattened full-data-to-render-data column buffer.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuLodLevel {
     data: [f32; 4],
 }
 
-/// Address of a 16×16 full-data source.  `detail` identifies the quadtree
-/// depth: each parent is exactly a 2×2 merge of sources at the preceding
-/// detail level.
+/// Address of a 64×64 FullDataSource. `detail` is the source's block-detail
+/// level; its parent is a source with twice the world-cell size.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct LodSectionKey {
     detail: u8,
@@ -2066,91 +2083,247 @@ struct LodSectionKey {
 }
 
 impl LodSectionKey {
-    fn parent(self) -> Option<Self> {
-        let detail = self.detail.checked_add(1)?;
-        (usize::from(detail) < LOD_LEVEL_COUNT).then_some(Self {
-            detail,
-            x: self.x.div_euclid(2),
-            z: self.z.div_euclid(2),
-        })
-    }
-
     fn factor(self) -> i32 {
         LOD_LEVEL_FACTORS[self.detail as usize]
     }
 
     fn world_minimum(self) -> (i32, i32) {
-        let side = LOD_SECTION_SIDE * CHUNK_SIZE * self.factor();
+        let side = LOD_SECTION_SIDE * self.factor();
         (self.x * side, self.z * side)
     }
 }
 
-/// One Distant-Horizons-like full-data source.  A packed value keeps the
-/// top height in 1/16ths plus separate top and cliff materials, so a distant
-/// hill does not degenerate into a uniformly green cuboid.
+/// One reduced `ColumnRenderSource` column.  Each packed entry carries a
+/// 1/16th-block Y span plus separate top and side materials.  This is the
+/// Rust/wgpu equivalent of DH's `RenderDataPoint` list, capped by its MEDIUM
+/// vertical-quality count for the relevant detail level.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LodRenderColumn {
+    slices: [u32; LOD_MAX_VERTICAL_SLICES],
+}
+
+/// One DH-style full-data source plus its derived render source.  `full_columns`
+/// is intentionally preserved in memory and on disk so provider updates can
+/// operate on source data, never on an already quality-capped GPU column.
 #[derive(Clone)]
 struct LodSection {
     key: LodSectionKey,
-    columns: Vec<u32>,
+    full_columns: Vec<Vec<LodRenderSlice>>,
+    columns: Vec<LodRenderColumn>,
+}
+
+impl LodSection {
+    fn from_full(key: LodSectionKey, full_columns: Vec<Vec<LodRenderSlice>>) -> Self {
+        debug_assert_eq!(full_columns.len(), LOD_SECTION_COLUMN_COUNT);
+        let full_columns = full_columns
+            .into_iter()
+            .map(resolve_lod_full_slices)
+            .collect::<Vec<_>>();
+        let target_count = LOD_VERTICAL_SLICE_COUNTS[key.detail as usize];
+        let columns = full_columns
+            .iter()
+            .cloned()
+            .map(|column| reduce_lod_render_slices(column, target_count))
+            .collect();
+        Self {
+            key,
+            full_columns,
+            columns,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LodGenerationRequest {
+/// A request for one independently generated, 64×64 full-data source.
+///
+/// This is the equivalent of DH's retrieval task.  Crucially, the requested
+/// detail is generated directly by the world-data provider; a render request
+/// never expands itself into a recursive tree of child render sections.
+struct DataSourceRetrievalTask {
     key: LodSectionKey,
-    priority: i32,
 }
 
-impl Ord for LodGenerationRequest {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is a max heap; invert distance so sections nearest the
-        // player are generated first.  The coordinates make ties deterministic.
-        other
-            .priority
-            .cmp(&self.priority)
-            .then_with(|| other.key.detail.cmp(&self.key.detail))
-            .then_with(|| other.key.z.cmp(&self.key.z))
-            .then_with(|| other.key.x.cmp(&self.key.x))
+/// Rust equivalent of DH's `WorldGenerationQueue`: requested full-data
+/// sources are deduplicated, ordered around the generation target, and built
+/// away from the render/UI thread.
+struct WorldGenerationQueue {
+    state: Mutex<WorldGenerationQueueState>,
+    ready: Condvar,
+}
+
+struct WorldGenerationQueueState {
+    /// DH keeps this separately from submitted tasks and reevaluates task
+    /// order as the player moves.  It prevents a camera turn from draining a
+    /// long, stale near-to-far heap before the new view begins to fill.
+    generation_target: ChunkPos,
+    /// DH's waiting-task map: only these tasks are cancellable when the
+    /// render quadtree moves. A task already handed to a worker is left alone
+    /// and its completed result can be reused if it becomes visible again.
+    waiting: HashMap<LodSectionKey, DataSourceRetrievalTask>,
+    in_progress: HashSet<LodSectionKey>,
+}
+
+impl WorldGenerationQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WorldGenerationQueueState {
+                generation_target: ChunkPos { x: 0, z: 0 },
+                waiting: HashMap::new(),
+                in_progress: HashSet::new(),
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// DH's `startAndSetTargetPos`.  Waiting tasks are intentionally not
+    /// rebuilt: `take_next_task` picks from the map against this latest
+    /// target, so reprioritising a view change is constant-time here.
+    fn set_generation_target(&self, target: ChunkPos) {
+        let mut state = self.state.lock().expect("LOD build queue poisoned");
+        state.generation_target = target;
+        self.ready.notify_all();
+    }
+
+    fn submit_retrieval_task(&self, request: DataSourceRetrievalTask) {
+        let mut state = self.state.lock().expect("LOD build queue poisoned");
+        if !state.in_progress.contains(&request.key) && !state.waiting.contains_key(&request.key) {
+            state.waiting.insert(request.key, request);
+            self.ready.notify_one();
+        }
+    }
+
+    fn take_next_task(&self) -> DataSourceRetrievalTask {
+        let mut state = self.state.lock().expect("LOD build queue poisoned");
+        loop {
+            if let Some(key) = state.waiting.keys().copied().min_by_key(|key| {
+                (
+                    lod_request_priority(*key, state.generation_target),
+                    key.detail,
+                    key.z,
+                    key.x,
+                )
+            }) && let Some(request) = state.waiting.remove(&key)
+            {
+                state.in_progress.insert(request.key);
+                return request;
+            }
+            state = self.ready.wait(state).expect("LOD build queue poisoned");
+        }
+    }
+
+    fn finish_task(&self, key: LodSectionKey) {
+        let mut state = self.state.lock().expect("LOD build queue poisoned");
+        state.in_progress.remove(&key);
+    }
+
+    /// Equivalent to DH's `removeRetrievalRequestIf`: discard only work that
+    /// has not started yet. This keeps a camera turn from filling workers with
+    /// sources outside the current render cut, without racing an active task.
+    fn remove_retrieval_requests_not_in(&self, visible: &HashSet<LodSectionKey>) {
+        let mut state = self.state.lock().expect("LOD build queue poisoned");
+        state.waiting.retain(|key, _| visible.contains(key));
     }
 }
 
-impl PartialOrd for LodGenerationRequest {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Sparse quadtree cut plus the background full-data provider.  The renderer
-/// consumes its current cut as compact clipmap metadata, while source data
-/// itself remains independent, asynchronously built and persisted on disk.
-struct LodQuadTree {
-    center: Option<ChunkPos>,
-    active: HashSet<LodSectionKey>,
+/// Local implementation of DH's generated full-data provider.  It owns the
+/// persisted full-data cache and the generation queue, while the render
+/// quadtree merely asks it for positions in its current cut.
+struct FullDataSourceProvider {
     cached: HashMap<LodSectionKey, LodSection>,
     queued: HashSet<LodSectionKey>,
-    requests: mpsc::Sender<LodGenerationRequest>,
+    world_generation: Arc<WorldGenerationQueue>,
     completed: mpsc::Receiver<LodSection>,
 }
 
-impl LodQuadTree {
+impl FullDataSourceProvider {
     fn new() -> Self {
-        let (request_sender, request_receiver) = mpsc::channel();
         let (completed_sender, completed_receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name("distant-horizons-data".into())
-            .spawn(move || lod_generation_worker(request_receiver, completed_sender))
-            .expect("could not start Distant Horizons data worker");
+        let world_generation = Arc::new(WorldGenerationQueue::new());
+        for worker_index in 0..LOD_STREAM_WORKERS {
+            let world_generation = world_generation.clone();
+            let completed = completed_sender.clone();
+            thread::Builder::new()
+                .name(format!("distant-horizons-data-{worker_index}"))
+                .spawn(move || world_generation_worker(world_generation, completed))
+                .expect("could not start Distant Horizons data worker");
+        }
         Self {
-            center: None,
-            active: HashSet::new(),
             cached: HashMap::new(),
             queued: HashSet::new(),
-            requests: request_sender,
+            world_generation,
             completed: completed_receiver,
         }
     }
 
+    fn get(&self, key: LodSectionKey) -> Option<&LodSection> {
+        self.cached.get(&key)
+    }
+
+    /// DH's `queuePositionForRetrieval`: cache hits return immediately;
+    /// missing data is handed to `WorldGenerationQueue` exactly once.
+    fn queue_position_for_retrieval(&mut self, key: LodSectionKey) {
+        if self.cached.contains_key(&key) || !self.queued.insert(key) {
+            return;
+        }
+        self.world_generation
+            .submit_retrieval_task(DataSourceRetrievalTask { key });
+    }
+
+    fn remove_retrieval_requests_not_in(&mut self, visible: &HashSet<LodSectionKey>) {
+        self.world_generation
+            .remove_retrieval_requests_not_in(visible);
+        self.queued.retain(|key| visible.contains(key));
+    }
+
+    /// Applies finished full-data sources exactly once.  The caller receives
+    /// their keys so it can decide whether its visible render cut changed.
+    fn integrate_completed(&mut self) -> Vec<LodSectionKey> {
+        let mut changed = Vec::new();
+        while let Ok(section) = self.completed.try_recv() {
+            self.queued.remove(&section.key);
+            let key = section.key;
+            let differs = self
+                .cached
+                .get(&key)
+                .is_none_or(|previous| previous.columns != section.columns);
+            self.cached.insert(key, section);
+            if differs {
+                changed.push(key);
+            }
+        }
+        changed
+    }
+
+    fn prune_memory_cache(&mut self, center: ChunkPos) {
+        self.cached.retain(|key, _| {
+            let (minimum_x, minimum_z) = key.world_minimum();
+            let section_radius = (LOD_SECTION_SIDE * key.factor() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            (minimum_x.div_euclid(CHUNK_SIZE) - center.x).abs() <= LOD_RADIUS + section_radius * 3
+                && (minimum_z.div_euclid(CHUNK_SIZE) - center.z).abs()
+                    <= LOD_RADIUS + section_radius * 3
+        });
+    }
+}
+
+/// The DH-style render quadtree.  It owns only the active render cut and its
+/// GPU packing; persistent full-data retrieval is delegated to the provider.
+struct LodQuadTree {
+    center: Option<ChunkPos>,
+    active: HashSet<LodSectionKey>,
+    provider: FullDataSourceProvider,
+}
+
+impl LodQuadTree {
+    fn new() -> Self {
+        Self {
+            center: None,
+            active: HashSet::new(),
+            provider: FullDataSourceProvider::new(),
+        }
+    }
+
     /// Rebuilds the visible *cut* of the sparse quadtree.  Each requested
-    /// source is 16×16 cells; the five nested levels form non-overlapping
+    /// source is 64×64 cells; the five nested levels form non-overlapping
     /// distance rings in the ray tracer, with an unloaded child naturally
     /// resolved by its available parent level.
     fn center_on(
@@ -2162,60 +2335,53 @@ impl LodQuadTree {
         let _profile_span = profile_span!("LOD::rebuild visible quadtree cut");
         self.center = Some(center);
         self.active.clear();
+        self.provider.world_generation.set_generation_target(center);
         let samples_per_level = (LOD_GRID_SIZE * LOD_GRID_SIZE) as usize;
 
         for (detail, factor) in LOD_LEVEL_FACTORS.iter().copied().enumerate() {
             let half_width = LOD_GRID_SIZE / 2;
-            let origin_chunk = ChunkPos {
-                x: center.x - half_width * factor,
-                z: center.z - half_width * factor,
-            };
+            let origin_x = center.x * CHUNK_SIZE - half_width * factor;
+            let origin_z = center.z * CHUNK_SIZE - half_width * factor;
             let sample_offset = detail * samples_per_level;
             lod_levels[detail] = GpuLodLevel {
                 data: [
-                    (origin_chunk.x * CHUNK_SIZE) as f32,
-                    (origin_chunk.z * CHUNK_SIZE) as f32,
-                    (CHUNK_SIZE * factor) as f32,
+                    origin_x as f32,
+                    origin_z as f32,
+                    factor as f32,
                     sample_offset as f32,
                 ],
             };
 
             for z in 0..LOD_GRID_SIZE {
                 for x in 0..LOD_GRID_SIZE {
-                    let global_chunk_x = origin_chunk.x + x * factor;
-                    let global_chunk_z = origin_chunk.z + z * factor;
+                    let global_x = origin_x + x * factor;
+                    let global_z = origin_z + z * factor;
                     let key = LodSectionKey {
                         detail: detail as u8,
-                        x: global_chunk_x.div_euclid(LOD_SECTION_SIDE * factor),
-                        z: global_chunk_z.div_euclid(LOD_SECTION_SIDE * factor),
+                        x: global_x.div_euclid(LOD_SECTION_SIDE * factor),
+                        z: global_z.div_euclid(LOD_SECTION_SIDE * factor),
                     };
                     self.active.insert(key);
                 }
             }
         }
 
-        for key in self.active.iter().copied() {
-            if let Some(parent) = key.parent() {
-                debug_assert_eq!(parent.factor(), key.factor() * 2);
-            }
-            if self.cached.contains_key(&key) || !self.queued.insert(key) {
-                continue;
-            }
-            let (minimum_x, minimum_z) = key.world_minimum();
-            let request = LodGenerationRequest {
-                key,
-                priority: ((minimum_x.div_euclid(CHUNK_SIZE) - center.x).abs()
-                    + (minimum_z.div_euclid(CHUNK_SIZE) - center.z).abs()),
-            };
-            // The worker cannot disappear while this tree owns the receiver;
-            // a disconnect would be a programming error, not a recoverable
-            // missing terrain condition.
-            self.requests
-                .send(request)
-                .expect("Distant Horizons data worker stopped unexpectedly");
+        // Keep the generation queue aligned with the current DH render cut.
+        // In-progress work is intentionally not cancelled; only waiting tasks
+        // are discarded, exactly like `WorldGenerationQueue`.
+        self.provider.remove_retrieval_requests_not_in(&self.active);
+
+        // Submit the visible cut in deterministic near-to-far, fine-to-coarse
+        // order.  The provider builds every requested detail directly, just
+        // as DH's generated full-data source provider does for API sources.
+        let mut requested_keys = self.active.iter().copied().collect::<Vec<_>>();
+        requested_keys
+            .sort_by_key(|key| (lod_request_priority(*key, center), key.detail, key.z, key.x));
+        for key in requested_keys {
+            self.provider.queue_position_for_retrieval(key);
         }
         self.pack_visible_sources(lod_samples);
-        self.prune_memory_cache(center);
+        self.provider.prune_memory_cache(center);
     }
 
     /// Moves completed I/O/generation work into the data source cache.  It is
@@ -2223,17 +2389,11 @@ impl LodQuadTree {
     /// far terrain build.
     fn collect_completed(&mut self, lod_samples: &mut [u32]) -> bool {
         let _profile_span = profile_span!("LOD::integrate completed sections");
-        let mut changed = false;
-        while let Ok(section) = self.completed.try_recv() {
-            self.queued.remove(&section.key);
-            if self.active.contains(&section.key) {
-                changed |= self
-                    .cached
-                    .get(&section.key)
-                    .is_none_or(|previous| previous.columns != section.columns);
-            }
-            self.cached.insert(section.key, section);
-        }
+        let changed = self
+            .provider
+            .integrate_completed()
+            .into_iter()
+            .any(|key| self.active.contains(&key));
         if changed {
             self.pack_visible_sources(lod_samples);
         }
@@ -2249,44 +2409,65 @@ impl LodQuadTree {
         lod_samples.fill(0);
         for (detail, factor) in LOD_LEVEL_FACTORS.iter().copied().enumerate() {
             let half_width = LOD_GRID_SIZE / 2;
-            let origin_chunk = ChunkPos {
-                x: center.x - half_width * factor,
-                z: center.z - half_width * factor,
-            };
+            let origin_x = center.x * CHUNK_SIZE - half_width * factor;
+            let origin_z = center.z * CHUNK_SIZE - half_width * factor;
             let sample_offset = detail * samples_per_level;
             for z in 0..LOD_GRID_SIZE {
                 for x in 0..LOD_GRID_SIZE {
-                    let global_chunk_x = origin_chunk.x + x * factor;
-                    let global_chunk_z = origin_chunk.z + z * factor;
+                    let global_x = origin_x + x * factor;
+                    let global_z = origin_z + z * factor;
                     let key = LodSectionKey {
                         detail: detail as u8,
-                        x: global_chunk_x.div_euclid(LOD_SECTION_SIDE * factor),
-                        z: global_chunk_z.div_euclid(LOD_SECTION_SIDE * factor),
+                        x: global_x.div_euclid(LOD_SECTION_SIDE * factor),
+                        z: global_z.div_euclid(LOD_SECTION_SIDE * factor),
                     };
-                    let local_x = global_chunk_x
+                    let local_x = global_x
                         .rem_euclid(LOD_SECTION_SIDE * factor)
                         .div_euclid(factor) as usize;
-                    let local_z = global_chunk_z
+                    let local_z = global_z
                         .rem_euclid(LOD_SECTION_SIDE * factor)
                         .div_euclid(factor) as usize;
-                    if let Some(section) = self.cached.get(&key) {
-                        lod_samples[sample_offset + (x + LOD_GRID_SIZE * z) as usize] =
-                            section.columns[local_x + LOD_SECTION_SIDE as usize * local_z];
+                    if let Some(section) = self.provider.get(key) {
+                        let gpu_offset = (sample_offset + (x + LOD_GRID_SIZE * z) as usize)
+                            * LOD_MAX_VERTICAL_SLICES;
+                        lod_samples[gpu_offset..gpu_offset + LOD_MAX_VERTICAL_SLICES]
+                            .copy_from_slice(
+                                &section.columns[local_x + LOD_SECTION_SIDE as usize * local_z]
+                                    .slices,
+                            );
                     }
                 }
             }
         }
     }
+}
 
-    fn prune_memory_cache(&mut self, center: ChunkPos) {
-        self.cached.retain(|key, _| {
-            let (minimum_x, minimum_z) = key.world_minimum();
-            let section_radius = LOD_SECTION_SIDE * key.factor() / CHUNK_SIZE;
-            (minimum_x.div_euclid(CHUNK_SIZE) - center.x).abs() <= LOD_RADIUS + section_radius * 3
-                && (minimum_z.div_euclid(CHUNK_SIZE) - center.z).abs()
-                    <= LOD_RADIUS + section_radius * 3
-        });
-    }
+/// Manhattan distance from the detailed-window centre to the nearest block in
+/// a section.  It is zero for every source that contains the camera, and the
+/// request ordering then breaks ties by detail (fine before coarse).
+fn lod_request_priority(key: LodSectionKey, center: ChunkPos) -> i32 {
+    let side = LOD_SECTION_SIDE * key.factor();
+    let minimum_x = key.x * side;
+    let minimum_z = key.z * side;
+    let maximum_x = minimum_x + side - 1;
+    let maximum_z = minimum_z + side - 1;
+    let center_x = center.x * CHUNK_SIZE;
+    let center_z = center.z * CHUNK_SIZE;
+    let distance_x = if center_x < minimum_x {
+        minimum_x - center_x
+    } else if center_x > maximum_x {
+        center_x - maximum_x
+    } else {
+        0
+    };
+    let distance_z = if center_z < minimum_z {
+        minimum_z - center_z
+    } else if center_z > maximum_z {
+        center_z - maximum_z
+    } else {
+        0
+    };
+    distance_x + distance_z
 }
 
 fn lod_cache_root() -> PathBuf {
@@ -2312,7 +2493,7 @@ fn load_lod_section(key: LodSectionKey) -> Option<LodSection> {
     let _profile_span = profile_span!("LOD worker::load disk cache");
     let bytes = fs::read(lod_cache_path(key)).ok()?;
     let header_size = 20;
-    if bytes.len() != header_size + LOD_SECTION_COLUMN_COUNT * std::mem::size_of::<u32>()
+    if bytes.len() < header_size
         || bytes[0..4] != LOD_CACHE_MAGIC
         || u32::from_le_bytes(bytes[4..8].try_into().ok()?) != LOD_CACHE_VERSION
         || bytes[8] != key.detail
@@ -2321,11 +2502,24 @@ fn load_lod_section(key: LodSectionKey) -> Option<LodSection> {
     {
         return None;
     }
-    let columns = bytes[header_size..]
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four column bytes")))
-        .collect();
-    Some(LodSection { key, columns })
+    let mut offset = header_size;
+    let mut full_columns = Vec::with_capacity(LOD_SECTION_COLUMN_COUNT);
+    for _ in 0..LOD_SECTION_COLUMN_COUNT {
+        let count_end = offset.checked_add(std::mem::size_of::<u16>())?;
+        let count = u16::from_le_bytes(bytes.get(offset..count_end)?.try_into().ok()?) as usize;
+        offset = count_end;
+        let column_end = offset.checked_add(count.checked_mul(std::mem::size_of::<u32>())?)?;
+        let column_bytes = bytes.get(offset..column_end)?;
+        let mut column = Vec::with_capacity(count);
+        for slice_bytes in column_bytes.chunks_exact(std::mem::size_of::<u32>()) {
+            column.push(unpack_lod_render_slice(u32::from_le_bytes(
+                slice_bytes.try_into().ok()?,
+            ))?);
+        }
+        offset = column_end;
+        full_columns.push(column);
+    }
+    (offset == bytes.len()).then(|| LodSection::from_full(key, full_columns))
 }
 
 fn save_lod_section(section: &LodSection) {
@@ -2337,31 +2531,185 @@ fn save_lod_section(section: &LodSection) {
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let mut bytes = Vec::with_capacity(20 + section.columns.len() * std::mem::size_of::<u32>());
+    let full_slice_count = section.full_columns.iter().map(Vec::len).sum::<usize>();
+    let mut bytes = Vec::with_capacity(
+        20 + section.full_columns.len() * std::mem::size_of::<u16>()
+            + full_slice_count * std::mem::size_of::<u32>(),
+    );
     bytes.extend_from_slice(&LOD_CACHE_MAGIC);
     bytes.extend_from_slice(&LOD_CACHE_VERSION.to_le_bytes());
     bytes.push(section.key.detail);
     bytes.extend_from_slice(&[0; 3]);
     bytes.extend_from_slice(&section.key.x.to_le_bytes());
     bytes.extend_from_slice(&section.key.z.to_le_bytes());
-    for column in &section.columns {
-        bytes.extend_from_slice(&column.to_le_bytes());
+    for column in &section.full_columns {
+        let Ok(count) = u16::try_from(column.len()) else {
+            return;
+        };
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for &slice in column {
+            let packed = pack_lod_render_slice(slice);
+            debug_assert_ne!(packed, 0);
+            bytes.extend_from_slice(&packed.to_le_bytes());
+        }
     }
     // A cache is an optimisation.  A denied or full disk must never prevent
     // the procedural source from appearing in this session.
     let _ = fs::write(path, bytes);
 }
 
-fn pack_lod_column(height: u16, top_material: u32, side_material: u32) -> u32 {
-    u32::from(height) | (top_material << 16) | (side_material << 24)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LodRenderSlice {
+    minimum: u16,
+    maximum: u16,
+    top_material: u32,
+    side_material: u32,
 }
 
-fn generate_lod_section(key: LodSectionKey) -> LodSection {
-    let _profile_span = profile_span!("LOD worker::generate full-data section");
-    let factor = key.factor();
-    let cell_size = CHUNK_SIZE * factor;
+/// Mirrors the information DH stores in each RenderDataPoint: a vertical span
+/// and an appearance on it.  World Y uses 1/16th units to preserve slabs.
+/// Ten bits cover the current 48-block world with room for a larger one.
+fn pack_lod_render_slice(slice: LodRenderSlice) -> u32 {
+    if slice.maximum <= slice.minimum {
+        return 0;
+    }
+    u32::from(slice.minimum)
+        | (u32::from(slice.maximum) << 10)
+        | ((slice.top_material & 63) << 20)
+        | ((slice.side_material & 63) << 26)
+}
+
+fn unpack_lod_render_slice(packed: u32) -> Option<LodRenderSlice> {
+    (packed != 0).then(|| LodRenderSlice {
+        minimum: (packed & 1023) as u16,
+        maximum: ((packed >> 10) & 1023) as u16,
+        top_material: (packed >> 20) & 63,
+        side_material: (packed >> 26) & 63,
+    })
+}
+
+fn lod_slice_priority(slice: LodRenderSlice) -> u8 {
+    match slice.top_material {
+        OAK_LEAVES | SPRUCE_LEAVES | ACACIA_LEAVES => 3,
+        10..=15 => 2,
+        WATER => 1,
+        _ => 0,
+    }
+}
+
+/// Converts overlapping raw source spans into the ordered, disjoint form DH
+/// calls render-data points.  This deliberately has no quality cap: it is the
+/// persistent full-data representation that parent sources consume.
+fn resolve_lod_full_slices(mut input: Vec<LodRenderSlice>) -> Vec<LodRenderSlice> {
+    input.retain(|slice| slice.maximum > slice.minimum);
+    if input.is_empty() {
+        return Vec::new();
+    }
+    let mut boundaries = input
+        .iter()
+        .flat_map(|slice| [slice.minimum, slice.maximum])
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let mut slices: Vec<LodRenderSlice> = Vec::with_capacity(boundaries.len());
+    for window in boundaries.windows(2) {
+        let minimum = window[0];
+        let maximum = window[1];
+        let Some(mut selected) = input
+            .iter()
+            .copied()
+            .filter(|slice| slice.minimum <= minimum && slice.maximum >= maximum)
+            .max_by_key(|slice| {
+                (
+                    lod_slice_priority(*slice),
+                    slice.maximum,
+                    slice.top_material,
+                )
+            })
+        else {
+            continue;
+        };
+        selected.minimum = minimum;
+        selected.maximum = maximum;
+        if let Some(previous) = slices.last_mut()
+            && previous.maximum == selected.minimum
+            && previous.top_material == selected.top_material
+            && previous.side_material == selected.side_material
+        {
+            previous.maximum = selected.maximum;
+        } else {
+            slices.push(selected);
+        }
+    }
+
+    slices
+}
+
+/// Rust translation of DH's vertical column reduction policy.  It starts from
+/// full source data, coalesces compatible neighbours, then only forces a merge
+/// of the least-significant short span if the active quality level needs it.
+fn reduce_lod_render_slices(input: Vec<LodRenderSlice>, target_count: usize) -> LodRenderColumn {
+    let mut slices = resolve_lod_full_slices(input);
+    while slices.len() > target_count {
+        let same_material_pair = slices
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| {
+                pair[0].top_material == pair[1].top_material
+                    && pair[0].side_material == pair[1].side_material
+            })
+            .min_by_key(|(_, pair)| {
+                pair[0].maximum - pair[0].minimum + pair[1].maximum - pair[1].minimum
+            })
+            .map(|(index, _)| index);
+        let index = same_material_pair.unwrap_or_else(|| {
+            // Keep the highest material appearance when a forced merge is
+            // needed, while consuming the least important/shortest span.
+            slices
+                .iter()
+                .enumerate()
+                .min_by_key(|(index, slice)| {
+                    (
+                        lod_slice_priority(**slice),
+                        slice.maximum - slice.minimum,
+                        *index,
+                    )
+                })
+                .map(|(index, _)| index)
+                .expect("nonempty reduced LOD column")
+                .min(slices.len() - 2)
+        });
+        let lower = slices[index];
+        let upper = slices[index + 1];
+        let mut merged = if lod_slice_priority(upper) >= lod_slice_priority(lower) {
+            upper
+        } else {
+            lower
+        };
+        merged.minimum = lower.minimum;
+        merged.maximum = upper.maximum;
+        slices[index] = merged;
+        slices.remove(index + 1);
+    }
+
+    // Shader storage uses a fixed stride, while the active count follows the
+    // same per-detail MEDIUM quality profile as DH.
+    let mut packed = [0; LOD_MAX_VERTICAL_SLICES];
+    for (index, slice) in slices.into_iter().rev().enumerate() {
+        packed[index] = pack_lod_render_slice(slice);
+    }
+    LodRenderColumn { slices: packed }
+}
+
+/// Procedural implementation of DH's `API_DATA_SOURCES` world-generator
+/// path.  The request's own detail level determines the horizontal sampling;
+/// it does not synchronously request a full subtree of finer sources.
+fn generate_lod_data_source(key: LodSectionKey) -> LodSection {
+    let _profile_span = profile_span!("LOD world generation::full-data source");
+    let cell_size = key.factor();
     let (minimum_x, minimum_z) = key.world_minimum();
-    let mut columns = Vec::with_capacity(LOD_SECTION_COLUMN_COUNT);
+    let mut full_columns = vec![Vec::<LodRenderSlice>::new(); LOD_SECTION_COLUMN_COUNT];
     for z in 0..LOD_SECTION_SIDE {
         for x in 0..LOD_SECTION_SIDE {
             let center_x = minimum_x + x * cell_size + cell_size / 2;
@@ -2396,39 +2744,133 @@ fn generate_lod_section(key: LodSectionKey) -> LodSection {
             };
             let side_material = if top_material == WATER {
                 WATER
-            } else if slope > (8 * factor) as u16 || height > 21 * 16 {
+            } else if slope > 8 || height > 21 * 16 {
                 STONE
             } else {
                 DIRT
             };
-            columns.push(pack_lod_column(height, top_material, side_material));
+            full_columns[(x + LOD_SECTION_SIDE * z) as usize].push(LodRenderSlice {
+                minimum: 0,
+                maximum: height,
+                top_material,
+                side_material,
+            });
         }
     }
-    LodSection { key, columns }
+
+    // DH asks the world generator for data at the source detail requested by
+    // the render quadtree.  Sample a bounded, evenly distributed set of the
+    // same deterministic Dynamic Trees placements here: the 64×64 source
+    // grid cannot retain individual branch voxels once a cell represents many
+    // chunks, but it does preserve species, wood and canopy material.
+    const MAX_TREE_SAMPLE_CHUNKS_PER_AXIS: i32 = 32;
+    const TREE_REACH: i32 = 0;
+    let maximum_x = minimum_x + LOD_SECTION_SIDE * cell_size;
+    let maximum_z = minimum_z + LOD_SECTION_SIDE * cell_size;
+    let minimum_chunk = ChunkPos {
+        x: (minimum_x - TREE_REACH).div_euclid(CHUNK_SIZE),
+        z: (minimum_z - TREE_REACH).div_euclid(CHUNK_SIZE),
+    };
+    let maximum_chunk = ChunkPos {
+        x: (maximum_x - 1 + TREE_REACH).div_euclid(CHUNK_SIZE),
+        z: (maximum_z - 1 + TREE_REACH).div_euclid(CHUNK_SIZE),
+    };
+    let source_chunks_wide =
+        (maximum_chunk.x - minimum_chunk.x + 1).max(maximum_chunk.z - minimum_chunk.z + 1);
+    let sample_count = source_chunks_wide.min(MAX_TREE_SAMPLE_CHUNKS_PER_AXIS);
+    let sample_stride = (source_chunks_wide + sample_count - 1) / sample_count;
+    for sample_z in 0..sample_count {
+        for sample_x in 0..sample_count {
+            let position = ChunkPos {
+                x: (minimum_chunk.x + sample_x * sample_stride + sample_stride / 2)
+                    .min(maximum_chunk.x),
+                z: (minimum_chunk.z + sample_z * sample_stride + sample_stride / 2)
+                    .min(maximum_chunk.z),
+            };
+            for tree_slot in 0..2 {
+                let Some(candidate) = tree_generation_candidate(position, tree_slot) else {
+                    continue;
+                };
+                include_lod_tree_source_column(
+                    &mut full_columns,
+                    minimum_x,
+                    minimum_z,
+                    cell_size,
+                    candidate,
+                );
+            }
+        }
+    }
+    LodSection::from_full(key, full_columns)
 }
 
-fn lod_generation_worker(
-    requests: mpsc::Receiver<LodGenerationRequest>,
+/// Aggregates a Dynamic Trees placement into the raw vertical records of its
+/// requested full-data source. The generator never invents a placement: seed,
+/// terrain root, species and materials all come from `tree_generation_candidate`.
+fn include_lod_tree_source_column(
+    columns: &mut [Vec<LodRenderSlice>],
+    minimum_x: i32,
+    minimum_z: i32,
+    cell_size: i32,
+    candidate: TreeGenerationCandidate,
+) {
+    let local_x = candidate.world_root.x - minimum_x;
+    let local_z = candidate.world_root.z - minimum_z;
+    if !(0..LOD_SECTION_SIDE * cell_size).contains(&local_x)
+        || !(0..LOD_SECTION_SIDE * cell_size).contains(&local_z)
+    {
+        return;
+    }
+    let x = local_x.div_euclid(cell_size) as usize;
+    let z = local_z.div_euclid(cell_size) as usize;
+    let form = TreeForm::from_seed(candidate.seed);
+    let total_height = match form {
+        TreeForm::Deciduous => 10 + (hash_u32(candidate.seed ^ 0x0A0C_0A0C) % 7) as i32,
+        TreeForm::Conifer => 14 + (hash_u32(candidate.seed ^ 0x050F_050F) % 9) as i32,
+        TreeForm::Acacia => 8 + (hash_u32(candidate.seed ^ 0x0ACA_C1A0) % 6) as i32,
+    };
+    let trunk_top = candidate.world_root.y + (total_height * 2 / 3).max(4);
+    let canopy_depth = match form {
+        TreeForm::Deciduous => 6,
+        TreeForm::Conifer => 9,
+        TreeForm::Acacia => 4,
+    };
+    let canopy_minimum = (candidate.world_root.y + total_height - canopy_depth).max(trunk_top - 2);
+    let canopy_maximum = candidate.world_root.y + total_height;
+    let column = &mut columns[x + LOD_SECTION_SIDE as usize * z];
+    column.push(LodRenderSlice {
+        minimum: (candidate.world_root.y * 16).clamp(0, 1023) as u16,
+        maximum: (trunk_top * 16).clamp(0, 1023) as u16,
+        top_material: form.bark_material(),
+        side_material: form.bark_material(),
+    });
+    column.push(LodRenderSlice {
+        minimum: (canopy_minimum * 16).clamp(0, 1023) as u16,
+        maximum: (canopy_maximum * 16).clamp(0, 1023) as u16,
+        top_material: form.leaf_material(),
+        side_material: form.leaf_material(),
+    });
+}
+
+fn world_generation_worker(
+    world_generation: Arc<WorldGenerationQueue>,
     completed: mpsc::Sender<LodSection>,
 ) {
-    profile_thread_name!("Distant Horizons worker");
-    let mut pending = BinaryHeap::new();
+    profile_thread_name!("Distant Horizons world-generation worker");
     loop {
-        if pending.is_empty() {
-            let Ok(request) = requests.recv() else {
-                return;
-            };
-            pending.push(request);
-        }
-        while let Ok(request) = requests.try_recv() {
-            pending.push(request);
-        }
-        let request = pending.pop().expect("nonempty LOD priority queue");
-        let section = load_lod_section(request.key).unwrap_or_else(|| {
-            let section = generate_lod_section(request.key);
+        let request = world_generation.take_next_task();
+        let section = if let Some(section) = load_lod_section(request.key) {
+            section
+        } else {
+            // Exactly one requested position is generated per worldgen task,
+            // matching DH's `WorldGenerationQueue` API-data-source path.
+            // Parent propagation is a separate provider update concern; it
+            // must never make a render request wait for a complete subtree.
+            let section = generate_lod_data_source(request.key);
             save_lod_section(&section);
             section
-        });
+        };
+        world_generation.finish_task(request.key);
         if completed.send(section).is_err() {
             return;
         }
@@ -2552,7 +2994,7 @@ impl World {
             detail_ring: (0, 0),
             detailed_blocks: vec![AIR; DETAIL_CHUNK_COUNT * CHUNK_BLOCK_COUNT],
             detail_occupancy: vec![0; DETAIL_OCCUPANCY_WORDS],
-            lod_samples: vec![0; LOD_SAMPLE_COUNT],
+            lod_samples: vec![0; LOD_GPU_SAMPLE_COUNT],
             lod_levels: [GpuLodLevel::zeroed(); LOD_LEVEL_COUNT],
             lod_tree: LodQuadTree::new(),
             gpu_trees: vec![GpuTree::zeroed(); MAX_TREES],
@@ -3516,6 +3958,41 @@ fn terrain_height_units(x: i32, z: i32) -> u16 {
     (whole * 16 + slab).clamp(2, (WORLD_HEIGHT - 4) * 16) as u16
 }
 
+/// One deterministic Dynamic Trees placement before the chunk's mutable
+/// substrate is touched.  Both detailed chunks and the distant-data provider
+/// use this exact function, so the LOD horizon cannot invent a different
+/// forest than the world that streams in later.
+#[derive(Clone, Copy)]
+struct TreeGenerationCandidate {
+    seed: u32,
+    local_root: IVec3,
+    world_root: IVec3,
+}
+
+fn tree_generation_candidate(
+    position: ChunkPos,
+    tree_slot: u32,
+) -> Option<TreeGenerationCandidate> {
+    let seed = hash_2d(position.x, position.z, 0x4d3b_1f01 + tree_slot);
+    if seed % 100 >= 72 {
+        return None;
+    }
+    let local_x = 2 + ((seed >> 8) % 12) as i32;
+    let local_z = 2 + ((seed >> 16) % 12) as i32;
+    let world_x = position.x * CHUNK_SIZE + local_x;
+    let world_z = position.z * CHUNK_SIZE + local_z;
+    let ground_units = terrain_height_units(world_x, world_z);
+    if ground_units < 160 {
+        return None;
+    }
+    let local_root = IVec3::new(local_x, i32::from(ground_units / 16), local_z);
+    Some(TreeGenerationCandidate {
+        seed,
+        local_root,
+        world_root: IVec3::new(world_x, local_root.y, world_z),
+    })
+}
+
 fn generate_chunk(position: ChunkPos) -> Chunk {
     let side = CHUNK_SIZE as usize;
     let mut blocks = vec![AIR; side * side * WORLD_HEIGHT as usize];
@@ -3550,24 +4027,15 @@ fn generate_chunk(position: ChunkPos) -> Chunk {
     // Each chunk can grow one or two independent Dynamic Trees graphs. The
     // renderer later decomposes them into Eco Machina HPD chains.
     for tree_slot in 0..2 {
-        let h = hash_2d(position.x, position.z, 0x4d3b_1f01 + tree_slot);
-        if h % 100 >= 72 {
-            continue;
-        }
-        let local_x = 2 + ((h >> 8) % 12) as i32;
-        let local_z = 2 + ((h >> 16) % 12) as i32;
-        let world_x = position.x * CHUNK_SIZE + local_x;
-        let world_z = position.z * CHUNK_SIZE + local_z;
-        let ground_units = terrain_height_units(world_x, world_z);
-        if ground_units < 160 {
-            continue;
-        }
-        let local_root = IVec3::new(local_x, i32::from(ground_units / 16), local_z);
-        let world_root = IVec3::new(world_x, local_root.y, world_z);
-        let Some(root) = prepare_dynamic_tree_root(&mut blocks, local_root, world_root) else {
+        let Some(candidate) = tree_generation_candidate(position, tree_slot) else {
             continue;
         };
-        trees.push(Tree::new(root, h));
+        let Some(root) =
+            prepare_dynamic_tree_root(&mut blocks, candidate.local_root, candidate.world_root)
+        else {
+            continue;
+        };
+        trees.push(Tree::new(root, candidate.seed));
     }
     Chunk {
         blocks: blocks.into(),

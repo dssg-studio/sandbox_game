@@ -24,6 +24,17 @@ fn direct_sunlight_uses_atmospheric_spectral_transmittance() {
 }
 
 #[test]
+fn lod_uses_world_stable_dithered_handoff_for_exact_tree_geometry() {
+    let shader = include_str!("shader.wgsl");
+    assert!(shader.contains("fn trace_lod_for_detail_fade"));
+    assert!(shader.contains("fn dh_detail_fade_noise"));
+    assert!(shader.contains("dh_detail_fade_amount(exact.t)"));
+    // AO and direct sun shadow rays deliberately retain the disjoint data
+    // sources, avoiding false self-occlusion from a coarse LOD cell.
+    assert!(shader.contains("return trace_lod_internal(ro, rd, max_distance, false)"));
+}
+
+#[test]
 fn atmosphere_precomputes_multiple_scattering_without_per_pixel_extra_rays() {
     let shader = include_str!("shader.wgsl");
     assert!(shader.contains("cs_atmosphere_multiple_scattering"));
@@ -193,7 +204,7 @@ fn streamed_windows_have_fixed_gpu_sizes() {
         world.detailed_blocks.len(),
         (DETAIL_DIAMETER * CHUNK_SIZE * DETAIL_DIAMETER * CHUNK_SIZE * WORLD_HEIGHT) as usize
     );
-    assert_eq!(world.lod_samples.len(), LOD_SAMPLE_COUNT);
+    assert_eq!(world.lod_samples.len(), LOD_GPU_SAMPLE_COUNT);
     assert_eq!(world.lod_levels.len(), LOD_LEVEL_COUNT);
     assert!(world.tree_count <= MAX_TREES);
 }
@@ -322,42 +333,119 @@ fn chunk_tree_blas_indices_relocate_into_the_gpu_atlas() {
 }
 
 #[test]
-fn lod_sources_follow_quadtree_parent_addresses() {
-    let child = LodSectionKey {
-        detail: 2,
-        x: -3,
-        z: 5,
-    };
-    assert_eq!(
-        child.parent(),
-        Some(LodSectionKey {
-            detail: 3,
-            x: -2,
-            z: 2,
-        })
-    );
-    let outermost = LodSectionKey {
-        detail: LOD_LEVEL_COUNT as u8 - 1,
-        x: 0,
-        z: 0,
-    };
-    assert!(outermost.parent().is_none());
-}
-
-#[test]
 fn lod_full_data_keeps_surface_and_cliff_materials() {
-    let section = generate_lod_section(LodSectionKey {
-        detail: 1,
+    let section = generate_lod_data_source(LodSectionKey {
+        detail: 0,
         x: 0,
         z: 0,
     });
     assert_eq!(section.columns.len(), LOD_SECTION_COLUMN_COUNT);
-    assert!(section.columns.iter().all(|packed| {
-        let height = packed & 65535;
-        let top = (packed >> 16) & 255;
-        let side = (packed >> 24) & 255;
-        height > 0 && matches!(top, GRASS | STONE | WATER) && matches!(side, DIRT | STONE | WATER)
+    let surface_slices = section
+        .full_columns
+        .iter()
+        .flat_map(|column| column.iter().copied())
+        .filter(|slice| slice.minimum == 0 && slice.maximum > 0)
+        .collect::<Vec<_>>();
+    assert!(!surface_slices.is_empty());
+    // Tree roots can legitimately replace a terrain span at Y=0.  Require
+    // that terrain material is still present rather than misclassifying roots
+    // as invalid terrain data.
+    assert!(surface_slices.iter().any(|slice| {
+        matches!(slice.top_material, GRASS | STONE | WATER)
+            && matches!(slice.side_material, DIRT | STONE | WATER)
     }));
+}
+
+#[test]
+fn lod_full_data_keeps_dynamic_tree_wood_and_foliage_slices() {
+    let source_chunk = (-8..=8)
+        .flat_map(|z| (-8..=8).map(move |x| ChunkPos { x, z }))
+        .find(|&position| tree_generation_candidate(position, 0).is_some())
+        .expect("the deterministic worldgen area contains a tree");
+    let section = generate_lod_data_source(LodSectionKey {
+        detail: 0,
+        x: (source_chunk.x * CHUNK_SIZE).div_euclid(LOD_SECTION_SIDE * LOD_LEVEL_FACTORS[0]),
+        z: (source_chunk.z * CHUNK_SIZE).div_euclid(LOD_SECTION_SIDE * LOD_LEVEL_FACTORS[0]),
+    });
+    let slices = section
+        .columns
+        .iter()
+        .flat_map(|column| column.slices)
+        .filter_map(unpack_lod_render_slice)
+        .collect::<Vec<_>>();
+    assert!(
+        slices
+            .iter()
+            .any(|slice| matches!(slice.top_material, 10..=12))
+    );
+    assert!(slices.iter().any(|slice| {
+        matches!(
+            slice.top_material,
+            OAK_LEAVES | SPRUCE_LEAVES | ACACIA_LEAVES
+        )
+    }));
+}
+
+#[test]
+fn lod_worldgen_produces_a_self_contained_source_at_every_requested_detail() {
+    for detail in 0..LOD_LEVEL_COUNT as u8 {
+        let section = generate_lod_data_source(LodSectionKey { detail, x: 0, z: 0 });
+        assert_eq!(section.key.detail, detail);
+        assert_eq!(section.columns.len(), LOD_SECTION_COLUMN_COUNT);
+        assert!(section.full_columns.iter().any(|column| !column.is_empty()));
+        assert!(section.columns.iter().all(|column| {
+            column.slices[LOD_VERTICAL_SLICE_COUNTS[detail as usize]..]
+                .iter()
+                .all(|slice| *slice == 0)
+        }));
+    }
+}
+
+#[test]
+fn lod_worldgen_queue_cancels_only_waiting_sources_outside_the_render_cut() {
+    let queue = WorldGenerationQueue::new();
+    let visible = LodSectionKey {
+        detail: 2,
+        x: 3,
+        z: -1,
+    };
+    let obsolete = LodSectionKey {
+        detail: 4,
+        x: -9,
+        z: 7,
+    };
+    queue.set_generation_target(ChunkPos { x: 0, z: 0 });
+    queue.submit_retrieval_task(DataSourceRetrievalTask { key: visible });
+    queue.submit_retrieval_task(DataSourceRetrievalTask { key: obsolete });
+    queue.remove_retrieval_requests_not_in(&HashSet::from([visible]));
+    let request = queue.take_next_task();
+    assert_eq!(request.key, visible);
+    queue.finish_task(visible);
+}
+
+#[test]
+fn lod_worldgen_queue_uses_the_latest_generation_target() {
+    let queue = WorldGenerationQueue::new();
+    let old_view = LodSectionKey {
+        detail: 0,
+        x: 0,
+        z: 0,
+    };
+    let new_view = LodSectionKey {
+        detail: 0,
+        x: 10,
+        z: 0,
+    };
+    queue.set_generation_target(ChunkPos { x: 0, z: 0 });
+    queue.submit_retrieval_task(DataSourceRetrievalTask { key: old_view });
+    queue.submit_retrieval_task(DataSourceRetrievalTask { key: new_view });
+
+    // DH changes its generation target separately from the waiting-task map.
+    // The next worker must therefore serve the new camera side first.
+    queue.set_generation_target(ChunkPos { x: 160, z: 0 });
+    let request = queue.take_next_task();
+    assert_eq!(request.key, new_view);
+    queue.finish_task(new_view);
 }
 
 #[test]
